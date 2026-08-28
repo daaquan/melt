@@ -143,3 +143,21 @@ def test_concurrent_same_payload(client) -> None:
         thread.join()
     assert errors == [201, 201]
     assert len(set(ids)) == 1
+
+
+def test_connection_pragmas_are_set(tmp_path) -> None:
+    """WAL, the busy timeout, and foreign keys must hold on a fresh connection.
+
+    Only journal_mode is stored in the file; the other two are per connection.
+    """
+    from melt.db import connect, init_db
+
+    path = tmp_path / "pragma.db"
+    init_db(path)
+    conn = connect(path)
+    try:
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+        assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 30000
+        assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+    finally:
+        conn.close()

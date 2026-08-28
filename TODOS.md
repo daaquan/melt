@@ -7,3 +7,4 @@
 - Disk-full SQLite path beyond generic 5xx
 - GNOME shortcut cwd vs locale path E2E
 - 1 MiB body inbox rendering
+- `locales/` lives at the repo root, so a wheel install has no catalog and `t()` returns raw keys. Docker works because it copies the directory and sets `MELT_LOCALE_DIR`. Move the catalogs into the package when melt is installed any other way.
