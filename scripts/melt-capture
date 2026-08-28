@@ -36,6 +36,8 @@ HELPER_ENV_KEYS = frozenset(
     }
 )
 MAX_BYTES = int(os.environ.get("MELT_MAX_BYTES", "1048576"))
+# urllib's default agent string is blocked by CDN bot filters in front of the API.
+USER_AGENT = "melt-capture/0.1"
 URL_RE = re.compile(r"^https?://\S+$")
 # WinRT clipboard history: newest-first text items as {"enabled": bool, "items": [str]}.
 WINDOWS_HISTORY_PS = r"""
@@ -469,6 +471,7 @@ def post_capture(api: str, token: str, kind: str, body: str, key: str) -> tuple[
             "Authorization": f"Bearer {token}",
             "Idempotency-Key": key,
             "Content-Type": "application/json",
+            "User-Agent": USER_AGENT,
         },
     )
     try:
@@ -556,7 +559,11 @@ def doctor(catalog: dict) -> int:
         print(f"clipboard history: {state} ({len(items)} text)")
     api = os.environ.get("MELT_API_URL", "http://127.0.0.1:8080")
     try:
-        with urllib.request.urlopen(api.rstrip("/") + "/healthz", timeout=3) as resp:
+        health = urllib.request.Request(
+            api.rstrip("/") + "/healthz",
+            headers={"User-Agent": USER_AGENT},
+        )
+        with urllib.request.urlopen(health, timeout=3) as resp:
             print(f"healthz: {resp.status}")
     except Exception as exc:  # noqa: BLE001: doctor must print any failure
         print(f"healthz: {exc}")

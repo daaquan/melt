@@ -57,6 +57,34 @@ def test_dead_letter_400_continues(tmp_path, monkeypatch) -> None:
     assert leftover == []
 
 
+def test_post_sends_a_user_agent(monkeypatch) -> None:
+    """A CDN in front of the API answers 403 to urllib's default agent."""
+    helper = load_helper()
+    seen: list[str | None] = []
+
+    class FakeResponse:
+        status = 201
+
+        def read(self) -> bytes:
+            return b"{}"
+
+        def __enter__(self) -> "FakeResponse":
+            return self
+
+        def __exit__(self, *exc: object) -> bool:
+            return False
+
+    def fake_urlopen(req, timeout=None):
+        seen.append(req.get_header("User-agent"))
+        return FakeResponse()
+
+    monkeypatch.setattr(helper.urllib.request, "urlopen", fake_urlopen)
+    helper.post_capture("http://x", "t", "text", "body", "k")
+
+    assert seen == [helper.USER_AGENT]
+    assert "urllib" not in helper.USER_AGENT
+
+
 def test_replay_401_skips_live(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("MELT_STATE_DIR", str(tmp_path))
     helper = load_helper()

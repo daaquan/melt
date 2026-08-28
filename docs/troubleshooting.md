@@ -10,6 +10,10 @@ Token does not match `MELT_TOKEN`. Put the same value in `.env` and in the helpe
 
 The helper could not reach the API (network, timeout, or 5xx). `docker compose ps` and `curl -sS http://127.0.0.1:8080/healthz`. Remaining lines stay in `~/.local/state/melt/failed.jsonl`.
 
+## 403 from a CDN
+
+A `403` whose body is not melt's JSON comes from the CDN in front of the API, not from melt. Cloudflare blocks the default `Python-urllib/*` agent, so the helper sends `User-Agent: melt-capture/0.1`. Any other client behind the same CDN has to set its own agent string.
+
 ## clipboard_empty
 
 No `text/plain` on the clipboard (empty, image, or HTML-only). Copy text and retry. `--stdin` reads stdin instead. On Windows, clipboard history must be on (`Win+V`) for older copies to be sent; only text items are posted.
