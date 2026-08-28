@@ -1,0 +1,380 @@
+from __future__ import annotations
+
+import logging
+import secrets as pysecrets
+import sqlite3
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Annotated
+
+from fastapi import Depends, FastAPI, Form, Header, HTTPException, Query, Request
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel, Field
+from starlette.middleware.base import BaseHTTPMiddleware
+
+from melt import config
+from melt.db import (
+    HashConflict,
+    IdempotencyConflict,
+    connect,
+    delete_capture,
+    ingest,
+    mark_reuse,
+    recency_list,
+    search_sources,
+    source_detail,
+    undo_latest,
+)
+from melt.i18n import t, load_catalog
+from melt.normalize import NormalizeError, infer_kind, normalize
+from melt.secrets import looks_like_secret
+
+log = logging.getLogger("melt")
+logging.basicConfig(level=logging.INFO)
+
+ROOT = Path(__file__).resolve().parent
+TEMPLATES = Jinja2Templates(directory=str(ROOT / "templates"))
+TEMPLATES.env.autoescape = True
+
+DISPLAY_CHARS = 20_000
+LOGIN_MAX = 4096
+SIZE_OVERHEAD = 4096
+
+
+class SizeLimitMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        length = request.headers.get("content-length")
+        if request.url.path == "/v1/login":
+            limit = LOGIN_MAX
+        else:
+            limit = config.max_bytes() + SIZE_OVERHEAD
+        if length is not None:
+            try:
+                n = int(length)
+            except ValueError:
+                n = 0
+            if n > limit:
+                return JSONResponse(
+                    status_code=413,
+                    content=_problem("too_large", "body exceeds 1 MiB", 413),
+                )
+        return await call_next(request)
+
+
+def _problem(code: str, detail: str, status: int) -> dict:
+    return {
+        "type": f"https://github.com/daaquan/melt/blob/main/docs/troubleshooting.md#{code}",
+        "title": code,
+        "status": status,
+        "detail": detail,
+        "code": code,
+    }
+
+
+def get_conn():
+    conn = connect(config.db_path())
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+def is_authed(request: Request, authorization: str | None) -> bool:
+    token = config.token()
+    if not token:
+        return False
+    if authorization and authorization.startswith("Bearer "):
+        given = authorization.removeprefix("Bearer ")
+        if pysecrets.compare_digest(given, token):
+            return True
+    cookie = request.cookies.get(config.COOKIE_NAME, "")
+    return bool(cookie) and pysecrets.compare_digest(cookie, token)
+
+
+def require_auth(
+    request: Request,
+    authorization: Annotated[str | None, Header()] = None,
+) -> None:
+    if not is_authed(request, authorization):
+        raise HTTPException(status_code=401, detail=_problem("auth", "token mismatch", 401))
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    if not config.token():
+        log.warning("MELT_TOKEN is empty; all auth will fail")
+    app.state.conn = connect(config.db_path())
+    app.state.catalog = load_catalog()
+    try:
+        yield
+    finally:
+        app.state.conn.close()
+
+
+app = FastAPI(title="melt", docs_url=None, redoc_url=None, lifespan=lifespan)
+app.add_middleware(SizeLimitMiddleware)
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    host = request.headers.get("host", "")
+    hostname = host.split(":")[0]
+    if hostname not in {"127.0.0.1", "localhost", "testserver"}:
+        return JSONResponse(status_code=400, content=_problem("bad_host", "host not allowed", 400))
+    response: Response = await call_next(request)
+    response.headers["Content-Security-Policy"] = "default-src 'self'"
+    return response
+
+
+@app.get("/healthz")
+def healthz() -> dict:
+    return {"ok": True}
+
+
+class CaptureIn(BaseModel):
+    kind: str | None = None
+    body: str = Field(default="")
+
+
+@app.post("/v1/captures")
+def post_capture(
+    payload: CaptureIn,
+    request: Request,
+    conn: sqlite3.Connection = Depends(get_conn),
+    authorization: Annotated[str | None, Header()] = None,
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+) -> JSONResponse:
+    require_auth(request, authorization)
+    body = payload.body
+    kind = payload.kind or infer_kind(body)
+    if not config.allow_secrets() and looks_like_secret(body):
+        raise HTTPException(
+            status_code=400,
+            detail=_problem("secret_blocked", "body looks like a secret", 400),
+        )
+    key = idempotency_key or str(__import__("uuid").uuid4())
+    try:
+        kind, normalized = normalize(kind, body)
+    except NormalizeError as exc:
+        status = 413 if exc.code == "too_large" else 400
+        raise HTTPException(status_code=status, detail=_problem(exc.code, str(exc), status)) from exc
+    try:
+        result = ingest(
+            conn,
+            kind=kind,
+            raw_body=body,
+            normalized_body=normalized,
+            idempotency_key=key,
+        )
+    except HashConflict:
+        raise HTTPException(
+            status_code=409,
+            detail=_problem("conflict_hash", "hash collision with different body", 409),
+        )
+    except IdempotencyConflict:
+        raise HTTPException(
+            status_code=409,
+            detail=_problem("conflict_idempotency", "Idempotency-Key reused with different body", 409),
+        )
+    except sqlite3.OperationalError:
+        raise HTTPException(
+            status_code=503,
+            detail=_problem("disk_full", "sqlite operational error", 503),
+        )
+    log.info(
+        "ingest capture_id=%s source_id=%s occ=%s",
+        result["capture_id"],
+        result["source_id"],
+        result["occurrence_count"],
+    )
+    return JSONResponse(
+        status_code=201,
+        content={
+            "capture_id": result["capture_id"],
+            "source_id": result["source_id"],
+            "occurrence_count": result["occurrence_count"],
+            "digest_status": result["digest_status"],
+        },
+    )
+
+
+@app.get("/v1/search")
+def api_search(
+    request: Request,
+    q: str = "",
+    conn: sqlite3.Connection = Depends(get_conn),
+    authorization: Annotated[str | None, Header()] = None,
+) -> dict:
+    require_auth(request, authorization)
+    rows = search_sources(conn, q) if q else []
+    return {
+        "hits": [
+            {
+                "source_id": row["source_id"],
+                "captured_at": row["captured_at"],
+                "occurrence_count": row["occ"],
+            }
+            for row in rows
+        ]
+    }
+
+
+@app.get("/v1/sources/{source_id}")
+def api_source(
+    source_id: str,
+    request: Request,
+    conn: sqlite3.Connection = Depends(get_conn),
+    authorization: Annotated[str | None, Header()] = None,
+) -> dict:
+    require_auth(request, authorization)
+    detail = source_detail(conn, source_id)
+    if detail is None:
+        raise HTTPException(status_code=404, detail=_problem("not_found", "source missing", 404))
+    digest = detail["digest"]
+    latest = detail["captures"][0] if detail["captures"] else None
+    return {
+        "source_id": source_id,
+        "kind": detail["source"]["kind"],
+        "raw_body": latest["raw_body"] if latest else "",
+        "normalized_body": detail["source"]["normalized_body"],
+        "digest": None
+        if digest is None
+        else {
+            "summary": digest["summary"],
+            "model": digest["model"],
+            "prompt_id": digest["prompt_id"],
+        },
+        "captured_at": [row["captured_at"] for row in detail["captures"]],
+    }
+
+
+class ReuseIn(BaseModel):
+    kind: str
+
+
+@app.post("/v1/sources/{source_id}/reuse")
+def api_reuse(
+    source_id: str,
+    payload: ReuseIn,
+    request: Request,
+    conn: sqlite3.Connection = Depends(get_conn),
+    authorization: Annotated[str | None, Header()] = None,
+) -> dict:
+    require_auth(request, authorization)
+    if payload.kind not in {"copy_source", "mark_used"}:
+        raise HTTPException(status_code=400, detail=_problem("bad_reuse", "unknown reuse kind", 400))
+    if source_detail(conn, source_id) is None:
+        raise HTTPException(status_code=404, detail=_problem("not_found", "source missing", 404))
+    mark_reuse(conn, source_id, payload.kind)
+    return {"ok": True}
+
+
+@app.post("/v1/captures/undo")
+def api_undo(
+    request: Request,
+    conn: sqlite3.Connection = Depends(get_conn),
+    authorization: Annotated[str | None, Header()] = None,
+) -> dict:
+    require_auth(request, authorization)
+    result = undo_latest(conn)
+    return {"ok": True, "result": result}
+
+
+@app.delete("/v1/captures/{capture_id}")
+def api_delete(
+    capture_id: str,
+    request: Request,
+    conn: sqlite3.Connection = Depends(get_conn),
+    authorization: Annotated[str | None, Header()] = None,
+) -> dict:
+    require_auth(request, authorization)
+    result = delete_capture(conn, capture_id)
+    if result == "missing":
+        raise HTTPException(status_code=404, detail=_problem("not_found", "capture missing", 404))
+    return {"ok": True, "result": result}
+
+
+@app.get("/", response_class=HTMLResponse)
+def inbox(
+    request: Request,
+    q: str = Query(default=""),
+    selected: str | None = None,
+    conn: sqlite3.Connection = Depends(get_conn),
+    authorization: Annotated[str | None, Header()] = None,
+) -> HTMLResponse:
+    if not is_authed(request, authorization):
+        return TEMPLATES.TemplateResponse(
+            request,
+            "login.html",
+            {"error": None, "t": t, "catalog": getattr(request.app.state, "catalog", {})},
+        )
+    rows = recency_list(conn) if not q else search_sources(conn, q)
+    catalog = request.app.state.catalog
+    current = None
+    if rows:
+        wanted = selected or rows[0]["source_id"]
+        current = source_detail(conn, wanted)
+        if current is None and rows:
+            current = source_detail(conn, rows[0]["source_id"])
+    return TEMPLATES.TemplateResponse(
+        request,
+        "inbox.html",
+        {
+            "q": q,
+            "rows": rows,
+            "current": current,
+            "t": t,
+            "catalog": catalog,
+            "display_chars": DISPLAY_CHARS,
+        },
+    )
+
+
+@app.post("/v1/login")
+def login(request: Request, token: Annotated[str, Form()] = "") -> Response:
+    if not config.token() or not pysecrets.compare_digest(token, config.token()):
+        return TEMPLATES.TemplateResponse(
+            request,
+            "login.html",
+            {"error": "auth", "t": t, "catalog": getattr(request.app.state, "catalog", {})},
+            status_code=401,
+        )
+    resp = RedirectResponse("/", status_code=302)
+    resp.set_cookie(
+        config.COOKIE_NAME,
+        token,
+        httponly=True,
+        samesite="strict",
+        path="/",
+        secure=False,
+    )
+    return resp
+
+
+@app.post("/v1/sources/{source_id}/reuse-form")
+def reuse_form(
+    source_id: str,
+    request: Request,
+    kind: Annotated[str, Form()] = "mark_used",
+    conn: sqlite3.Connection = Depends(get_conn),
+    authorization: Annotated[str | None, Header()] = None,
+) -> Response:
+    if not is_authed(request, authorization):
+        return RedirectResponse("/", status_code=302)
+    if kind in {"copy_source", "mark_used"} and source_detail(conn, source_id):
+        mark_reuse(conn, source_id, kind)
+    return RedirectResponse(f"/?selected={source_id}", status_code=302)
+
+
+@app.post("/v1/captures/{capture_id}/delete-form")
+def delete_form(
+    capture_id: str,
+    request: Request,
+    conn: sqlite3.Connection = Depends(get_conn),
+    authorization: Annotated[str | None, Header()] = None,
+) -> Response:
+    if not is_authed(request, authorization):
+        return RedirectResponse("/", status_code=302)
+    delete_capture(conn, capture_id)
+    return RedirectResponse("/", status_code=302)

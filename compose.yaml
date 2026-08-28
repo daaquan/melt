@@ -1,0 +1,19 @@
+services:
+  api:
+    build: .
+    env_file: .env
+    environment:
+      MELT_DB_PATH: /data/melt.db
+      MELT_LOCALE_DIR: /app/locales
+    ports:
+      - "${MELT_BIND:-127.0.0.1}:${MELT_PORT:-8080}:8080"
+    volumes:
+      - melt-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz')"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+volumes:
+  melt-data:
