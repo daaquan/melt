@@ -33,15 +33,45 @@ If the helper prints `Failed`, run `python3 scripts/melt-capture --doctor`.
 | `MELT_BIND` / `MELT_PORT` | compose publish | `127.0.0.1` / `8080` |
 | `MELT_DB_PATH` | API | `melt.db` (compose: `/data/melt.db`) |
 | `MELT_LOCALE_DIR` | API and helper | walk up from the file to `locales/` |
-| `MELT_STATE_DIR` | helper | `$XDG_STATE_HOME/melt` or `~/.local/state/melt` |
+| `MELT_STATE_DIR` | helper | Linux: `$XDG_STATE_HOME/melt` or `~/.local/state/melt`; Windows: `%LOCALAPPDATA%\melt` |
 | `MELT_ALLOW_SECRETS` | both | `0` (set `1` to store token-like text) |
 | `MELT_ALLOWED_HOSTS` | API | `127.0.0.1,localhost` (the `Host` allowlist) |
-| `MELT_CLIPBOARD_CMD` | helper | `wl-paste` on Wayland, else `xclip` |
-| `MELT_NOTIFY_CMD` | helper | `notify-send` |
+| `MELT_CLIPBOARD_CMD` | helper | Windows PowerShell; Linux: `wl-paste` on Wayland, else `xclip` |
+| `MELT_NOTIFY_CMD` | helper | Windows notification balloon; Linux: `notify-send` |
 
 ## Host helper
 
-`scripts/melt-capture` is stdlib-only. It reads the clipboard (or `--stdin`), POSTs `http://127.0.0.1:8080/v1/captures`, and toasts from `locales/en.json`.
+`scripts/melt-capture` is stdlib-only and runs on Windows and Linux. It reads the clipboard (or `--stdin`), POSTs `http://127.0.0.1:8080/v1/captures`, and shows a notification from `locales/en.json`.
+
+### Windows
+
+Start the API in Docker Desktop, then check the helper:
+
+```powershell
+python -m venv .venv
+.\scripts\melt-capture-windows.cmd --doctor
+```
+
+The helper is one shot, not a background app: each run saves the current clipboard and exits, which is why a console window only flashes. Register the hotkey to run it:
+
+```powershell
+.\scripts\install-windows-hotkey.ps1
+```
+
+That writes a Start Menu shortcut with `Ctrl+Alt+M`, running the helper through `pythonw.exe` so no window appears. Windows only honours a shortcut's hotkey from the Start Menu or the Desktop, so a shortcut left anywhere else silently does nothing. Pass `-Hotkey "CTRL+ALT+K"` for a different key, or `-Remove` to unregister.
+
+Copy some text, press the hotkey, and a balloon reports the result. Settings come from `.env` in the shortcut's working directory, so the helper and Compose share one `MELT_TOKEN`. Only helper settings are read from that file; `MELT_DB_PATH` and other server values are ignored. Failed captures stay under `%LOCALAPPDATA%\melt`.
+
+To build a standalone executable instead:
+
+```powershell
+.\scripts\build-windows.ps1
+.\dist\melt-capture.exe --doctor
+```
+
+The executable reads `.env` beside it or in its parent directory. For a downloaded CI artifact, rename `.env.example` to `.env`, set `MELT_TOKEN`, and keep both together. Managed Windows installations may block an unsigned local build; use the hotkey shortcut or sign the executable with your organization's certificate.
+
+### Linux
 
 Use an **absolute path** in shortcuts. GNOME often starts the command with `$HOME` as cwd, so `scripts/melt-capture` will miss `locales/` unless you set `MELT_LOCALE_DIR`.
 

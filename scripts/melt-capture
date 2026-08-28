@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import fcntl
 import json
 import os
 import re
@@ -16,6 +15,24 @@ import urllib.request
 import uuid
 from pathlib import Path
 
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
+
+# Server-only settings such as MELT_DB_PATH stay out, so sharing compose's .env
+# with the helper cannot repoint the API's database.
+HELPER_ENV_KEYS = frozenset(
+    {
+        "MELT_TOKEN",
+        "MELT_API_URL",
+        "MELT_ALLOW_SECRETS",
+        "MELT_STATE_DIR",
+        "MELT_LOCALE_DIR",
+        "MELT_CLIPBOARD_CMD",
+        "MELT_NOTIFY_CMD",
+    }
+)
 MAX_BYTES = int(os.environ.get("MELT_MAX_BYTES", "1048576"))
 URL_RE = re.compile(r"^https?://\S+$")
 SECRET_RES = (
@@ -30,6 +47,8 @@ def state_dir() -> Path:
     override = os.environ.get("MELT_STATE_DIR")
     if override:
         return Path(override)
+    if os.name == "nt":
+        return Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData/Local")) / "melt"
     xdg = os.environ.get("XDG_STATE_HOME")
     base = Path(xdg) if xdg else Path.home() / ".local/state"
     return base / "melt"
@@ -47,13 +66,52 @@ def lock_file() -> Path:
     return state_dir() / "helper.lock"
 
 
+def load_environment() -> Path | None:
+    """Fill missing helper settings from MELT_ENV_FILE, cwd, or next to a build."""
+    override = os.environ.get("MELT_ENV_FILE")
+    frozen = getattr(sys, "frozen", False)
+    candidates = [Path(override)] if override else [Path.cwd() / ".env"]
+    if frozen:
+        executable_dir = Path(sys.executable).resolve().parent
+        candidates.extend((executable_dir / ".env", executable_dir.parent / ".env"))
+    seen: set[Path] = set()
+    for path in candidates:
+        path = path.resolve()
+        if path in seen or not path.is_file():
+            continue
+        seen.add(path)
+        for raw_line in path.read_text(encoding="utf-8-sig").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            if key not in HELPER_ENV_KEYS or key in os.environ:
+                continue
+            value = value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+                value = value[1:-1]
+            os.environ[key] = value
+        return path
+    return None
+
+
 def locale_dir() -> Path | None:
     env = os.environ.get("MELT_LOCALE_DIR")
     if env:
         path = Path(env)
         return path if path.is_dir() else None
-    here = Path(__file__).resolve()
-    for parent in here.parents:
+    roots = [Path(__file__).resolve()]
+    bundle_dir = getattr(sys, "_MEIPASS", None)
+    if bundle_dir:
+        roots.insert(0, Path(bundle_dir))
+    if getattr(sys, "frozen", False):
+        roots.insert(0, Path(sys.executable).resolve().parent)
+    for root in roots:
+        candidate = root / "locales"
+        if (candidate / "en.json").is_file():
+            return candidate
+    for parent in Path(__file__).resolve().parents:
         candidate = parent / "locales"
         if (candidate / "en.json").is_file():
             return candidate
@@ -92,7 +150,30 @@ def notify(catalog: dict, title: str, body: str, no_notify: bool) -> None:
     if no_notify:
         print(f"{title}: {body}")
         return
-    cmd = os.environ.get("MELT_NOTIFY_CMD", "notify-send")
+    override = os.environ.get("MELT_NOTIFY_CMD")
+    if os.name == "nt" and not override:
+        script = (
+            "Add-Type -AssemblyName System.Windows.Forms;"
+            "$n=New-Object System.Windows.Forms.NotifyIcon;"
+            "$n.Icon=[System.Drawing.SystemIcons]::Information;"
+            "$n.BalloonTipTitle=$env:MELT_TOAST_TITLE;"
+            "$n.BalloonTipText=$env:MELT_TOAST_BODY;"
+            "$n.Visible=$true;$n.ShowBalloonTip(3000);"
+            "Start-Sleep -Milliseconds 3500;$n.Dispose()"
+        )
+        env = os.environ.copy()
+        env["MELT_TOAST_TITLE"] = title
+        env["MELT_TOAST_BODY"] = body
+        try:
+            subprocess.Popen(
+                ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+                env=env,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except OSError:
+            print(f"{title}: {body}", file=sys.stderr)
+        return
+    cmd = override or "notify-send"
     try:
         subprocess.run([cmd, title, body], check=False, timeout=5)
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
@@ -103,13 +184,25 @@ def read_clipboard() -> str | None:
     override = os.environ.get("MELT_CLIPBOARD_CMD")
     if override:
         argv = override.split()
+    elif os.name == "nt":
+        argv = [
+            "powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "[Console]::OutputEncoding=[Text.UTF8Encoding]::new(); Get-Clipboard -Raw",
+        ]
     elif os.environ.get("WAYLAND_DISPLAY"):
         argv = ["wl-paste", "--type", "text/plain"]
     else:
         argv = ["xclip", "-selection", "clipboard", "-t", "text/plain", "-o"]
     try:
         result = subprocess.run(
-            argv, check=False, capture_output=True, timeout=5
+            argv,
+            check=False,
+            capture_output=True,
+            timeout=5,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return None
@@ -124,18 +217,34 @@ def read_clipboard() -> str | None:
 def ensure_state() -> None:
     path = state_dir()
     path.mkdir(parents=True, exist_ok=True)
-    path.chmod(0o700)
+    if os.name != "nt":
+        path.chmod(0o700)
 
 
 def acquire_lock() -> int | None:
     ensure_state()
     fd = os.open(lock_file(), os.O_CREAT | os.O_RDWR, 0o600)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
+        if os.name == "nt":
+            if os.fstat(fd).st_size == 0:
+                os.write(fd, b"\0")
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        else:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (BlockingIOError, OSError):
         os.close(fd)
         return None
     return fd
+
+
+def release_lock(fd: int) -> None:
+    if os.name == "nt":
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+    else:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    os.close(fd)
 
 
 def append_jsonl(path: Path, obj: dict) -> None:
@@ -143,7 +252,8 @@ def append_jsonl(path: Path, obj: dict) -> None:
     line = json.dumps(obj, ensure_ascii=False) + "\n"
     fd = os.open(path, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
     try:
-        os.fchmod(fd, 0o600)
+        if os.name != "nt":
+            os.fchmod(fd, 0o600)
         os.write(fd, line.encode("utf-8"))
     finally:
         os.close(fd)
@@ -170,9 +280,11 @@ def write_failed(rows: list[dict]) -> None:
     tmp = path.with_suffix(".tmp")
     payload = "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows)
     tmp.write_text(payload, encoding="utf-8")
-    tmp.chmod(0o600)
+    if os.name != "nt":
+        tmp.chmod(0o600)
     tmp.replace(path)
-    path.chmod(0o600)
+    if os.name != "nt":
+        path.chmod(0o600)
 
 
 def collapse_failed(rows: list[dict]) -> list[dict]:
@@ -263,11 +375,13 @@ def replay_queue(catalog: dict, api: str, token: str, no_notify: bool) -> bool:
 
 
 def doctor(catalog: dict) -> int:
+    print(f"env file: {load_environment()}")
     print(f"locale: {locale_dir()}")
     print(f"api: {os.environ.get('MELT_API_URL', 'http://127.0.0.1:8080')}")
     print(f"token set: {'yes' if os.environ.get('MELT_TOKEN') else 'no'}")
     print(f"failed.jsonl: {failed_file()}")
-    for binary in ("notify-send", "wl-paste", "xclip"):
+    binaries = ("powershell.exe",) if os.name == "nt" else ("notify-send", "wl-paste", "xclip")
+    for binary in binaries:
         print(f"{binary}: {shutil.which(binary) or 'missing'}")
     api = os.environ.get("MELT_API_URL", "http://127.0.0.1:8080")
     try:
@@ -300,12 +414,23 @@ def capture_body(args: argparse.Namespace, catalog: dict, no_notify: bool) -> st
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="melt-capture")
+    parser = argparse.ArgumentParser(
+        prog="melt-capture",
+        description="Save clipboard text to a local melt inbox.",
+        epilog=(
+            "Examples:\n"
+            "  melt-capture\n"
+            "  melt-capture --stdin --no-notify < note.txt\n"
+            "  melt-capture --doctor"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument("--stdin", action="store_true", help="read payload from stdin")
     parser.add_argument("--doctor", action="store_true")
     parser.add_argument("--no-notify", action="store_true")
     parser.add_argument("--allow-secrets", action="store_true")
     args = parser.parse_args(argv)
+    load_environment()
     catalog = load_catalog()
     if args.doctor:
         return doctor(catalog)
@@ -383,8 +508,7 @@ def main(argv: list[str] | None = None) -> int:
         toast_for(catalog, code, args.no_notify)
         return 1
     finally:
-        fcntl.flock(fd, fcntl.LOCK_UN)
-        os.close(fd)
+        release_lock(fd)
 
 
 if __name__ == "__main__":

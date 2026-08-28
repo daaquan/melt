@@ -3,6 +3,8 @@ from __future__ import annotations
 import importlib.util
 import io
 import json
+import os
+import subprocess
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 from types import ModuleType
@@ -95,3 +97,61 @@ def test_live_auth_failure_keeps_the_body(tmp_path, monkeypatch) -> None:
 
     queued = helper.load_failed()
     assert [row["body"] for row in queued] == ["worth keeping"]
+
+
+def test_packaged_helper_loads_parent_env(tmp_path, monkeypatch) -> None:
+    helper = load_helper()
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    executable = dist / "melt-capture.exe"
+    executable.touch()
+    (tmp_path / ".env").write_text(
+        "# shared with compose\n"
+        "MELT_TOKEN=from-env-file\n"
+        "MELT_DB_PATH=/data/melt.db\n"
+        "OTHER_VALUE=ignored\n",
+        encoding="utf-8",
+    )
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    monkeypatch.setattr(helper.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(helper.sys, "executable", str(executable))
+    monkeypatch.delenv("MELT_ENV_FILE", raising=False)
+    monkeypatch.delenv("MELT_TOKEN", raising=False)
+    monkeypatch.delenv("MELT_DB_PATH", raising=False)
+    monkeypatch.delenv("OTHER_VALUE", raising=False)
+
+    assert helper.load_environment() == tmp_path / ".env"
+    assert os.environ["MELT_TOKEN"] == "from-env-file"
+    assert "OTHER_VALUE" not in os.environ
+    assert "MELT_DB_PATH" not in os.environ
+
+
+def test_helper_reads_env_from_working_directory(tmp_path, monkeypatch) -> None:
+    """A desktop shortcut passes settings by starting in the repo, not by exporting."""
+    helper = load_helper()
+    (tmp_path / ".env").write_text("MELT_TOKEN=from-working-dir\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("MELT_ENV_FILE", raising=False)
+    monkeypatch.delenv("MELT_TOKEN", raising=False)
+
+    assert helper.load_environment() == tmp_path / ".env"
+    assert os.environ["MELT_TOKEN"] == "from-working-dir"
+
+
+def test_windows_clipboard_uses_powershell(monkeypatch) -> None:
+    if os.name != "nt":
+        return
+    helper = load_helper()
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "日本語".encode())
+
+    monkeypatch.delenv("MELT_CLIPBOARD_CMD", raising=False)
+    monkeypatch.setattr(helper.subprocess, "run", fake_run)
+
+    assert helper.read_clipboard() == "日本語"
+    assert calls[0][0] == "powershell.exe"
