@@ -12,7 +12,7 @@ The helper could not reach the API (network, timeout, or 5xx). `docker compose p
 
 ## clipboard_empty
 
-No `text/plain` on the clipboard (empty, image, or HTML-only). Copy text and retry. `--stdin` reads stdin instead.
+No `text/plain` on the clipboard (empty, image, or HTML-only). Copy text and retry. `--stdin` reads stdin instead. On Windows, clipboard history must be on (`Win+V`) for older copies to be sent; only text items are posted.
 
 ## too_large
 
@@ -60,7 +60,7 @@ No such source or capture.
 
 ## bad_host
 
-`Host` was not in `MELT_ALLOWED_HOSTS`, which defaults to `127.0.0.1,localhost`. Compose publishes localhost only. Reaching the API under another name means adding it to that list.
+`Host` was not in `MELT_ALLOWED_HOSTS`, which defaults to `127.0.0.1,localhost`. Compose should stay on loopback. A reverse proxy hostname has to be on that list. Inbox login over HTTPS also needs `MELT_TRUST_PROXY=1` so the session cookie is marked `Secure`.
 
 ## bad_reuse
 

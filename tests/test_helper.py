@@ -25,7 +25,7 @@ def load_helper() -> ModuleType:
 def test_locale_keys_exist() -> None:
     en = json.loads((ROOT / "locales" / "en.json").read_text(encoding="utf-8"))
     ja = json.loads((ROOT / "locales" / "ja.json").read_text(encoding="utf-8"))
-    for key in ("toast.saved", "toast.saved_nth", "toast.failed", "list.empty"):
+    for key in ("toast.saved", "toast.saved_nth", "toast.saved_batch", "toast.failed", "list.empty"):
         assert key in en
         assert key in ja
     assert "Already seen" not in en.values()
@@ -155,3 +155,44 @@ def test_windows_clipboard_uses_powershell(monkeypatch) -> None:
 
     assert helper.read_clipboard() == "日本語"
     assert calls[0][0] == "powershell.exe"
+
+
+def test_parse_windows_history_keeps_a_single_item() -> None:
+    helper = load_helper()
+    enabled, items = helper.parse_windows_history_json('{"enabled":true,"items":"only"}')
+    assert enabled is True
+    assert items == ["only"]
+
+
+def test_select_bodies_posts_unseen_history_and_current(tmp_path) -> None:
+    helper = load_helper()
+    older = "old snippet"
+    current = "current snippet"
+    sent = {helper.body_hash(older)}
+    chosen = helper.select_bodies_to_post([older, current], sent, set())
+    assert chosen == [current]
+    chosen_again = helper.select_bodies_to_post([older, current], set(), set())
+    assert chosen_again == [older, current]
+    queued = helper.select_bodies_to_post([older, current], set(), {current})
+    assert queued == [older]
+
+
+def test_batch_capture_posts_each_body(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("MELT_STATE_DIR", str(tmp_path))
+    monkeypatch.setenv("MELT_LOCALE_DIR", str(ROOT / "locales"))
+    helper = load_helper()
+    posted: list[str] = []
+
+    def fake_post(api, token, kind, body, key):
+        posted.append(body)
+        return 201, {"capture_id": "x", "occurrence_count": 1}
+
+    monkeypatch.setattr(helper, "replay_queue", lambda *args, **kwargs: True)
+    monkeypatch.setattr(helper, "capture_bodies", lambda *args, **kwargs: ["one", "two"])
+    helper.post_capture = fake_post
+
+    assert helper.main(["--no-notify"]) == 0
+    assert posted == ["one", "two"]
+    stored = json.loads((tmp_path / "sent-hashes.json").read_text(encoding="utf-8"))
+    assert helper.body_hash("one") in stored
+    assert helper.body_hash("two") in stored

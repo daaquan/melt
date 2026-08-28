@@ -74,6 +74,39 @@ def test_login_wrong_token(client) -> None:
     assert CATALOG["login.error"] in r.text
 
 
+def test_login_cookie_is_not_secure_on_http(client) -> None:
+    r = client.post("/v1/login", data={"token": TOKEN}, follow_redirects=False)
+    cookie = r.headers.get("set-cookie", "").lower()
+    assert "melt_token=" in cookie
+    assert "secure" not in cookie
+    assert "httponly" in cookie
+
+
+def test_login_cookie_is_secure_behind_trusted_proxy(client, monkeypatch) -> None:
+    monkeypatch.setenv("MELT_TRUST_PROXY", "1")
+    r = client.post(
+        "/v1/login",
+        data={"token": TOKEN},
+        headers={"X-Forwarded-Proto": "https"},
+        follow_redirects=False,
+    )
+    cookie = r.headers.get("set-cookie", "").lower()
+    assert "secure" in cookie
+    assert r.headers.get("strict-transport-security")
+
+
+def test_forwarded_proto_ignored_without_trust_proxy(client) -> None:
+    r = client.post(
+        "/v1/login",
+        data={"token": TOKEN},
+        headers={"X-Forwarded-Proto": "https"},
+        follow_redirects=False,
+    )
+    cookie = r.headers.get("set-cookie", "").lower()
+    assert "secure" not in cookie
+    assert r.headers.get("strict-transport-security") is None
+
+
 def test_login_non_ascii_token_is_401_not_500(client) -> None:
     # secrets.compare_digest rejects non-ASCII str, so a str compare 500s here.
     r = client.post("/v1/login", data={"token": "caf\u00e9-\u30c8\u30fc\u30af\u30f3"})

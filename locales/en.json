@@ -26,6 +26,7 @@
   "action.delete_confirm": "Delete this capture? If it is the last one, the source is deleted too.",
   "toast.saved": "Saved",
   "toast.saved_nth": "Saved · {n}th time",
+  "toast.saved_batch": "Saved {n}",
   "toast.failed": "Failed",
   "error.clipboard_empty.title": "Failed",
   "error.clipboard_empty.body": "Clipboard has no text/plain. Copy text, then retry.",

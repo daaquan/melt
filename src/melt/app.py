@@ -85,6 +85,15 @@ def _problem(code: str, detail: str, status: int) -> dict:
     }
 
 
+def is_https(request: Request) -> bool:
+    if request.url.scheme == "https":
+        return True
+    if not config.trust_proxy():
+        return False
+    proto = request.headers.get("x-forwarded-proto", "").split(",")[0].strip().lower()
+    return proto == "https"
+
+
 def token_matches(given: str, expected: str) -> bool:
     """Constant-time compare.
 
@@ -161,6 +170,8 @@ async def security_headers(request: Request, call_next):
     response.headers["Content-Security-Policy"] = CSP
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["Referrer-Policy"] = "no-referrer"
+    if is_https(request):
+        response.headers["Strict-Transport-Security"] = "max-age=63072000"
     return response
 
 
@@ -461,7 +472,7 @@ def login(request: Request, token: Annotated[str, Form()] = "") -> Response:
         httponly=True,
         samesite="strict",
         path="/",
-        secure=False,
+        secure=is_https(request),
     )
     return resp
 

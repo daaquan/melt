@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
 import json
 import os
 import re
@@ -35,6 +37,44 @@ HELPER_ENV_KEYS = frozenset(
 )
 MAX_BYTES = int(os.environ.get("MELT_MAX_BYTES", "1048576"))
 URL_RE = re.compile(r"^https?://\S+$")
+# WinRT clipboard history: newest-first text items as {"enabled": bool, "items": [str]}.
+WINDOWS_HISTORY_PS = r"""
+[Console]::OutputEncoding = [Text.UTF8Encoding]::new()
+$ErrorActionPreference = "Stop"
+Add-Type -AssemblyName System.Runtime.WindowsRuntime | Out-Null
+$null = [Windows.ApplicationModel.DataTransfer.Clipboard, Windows.ApplicationModel.DataTransfer, ContentType = WindowsRuntime]
+$null = [Windows.ApplicationModel.DataTransfer.StandardDataFormats, Windows.ApplicationModel.DataTransfer, ContentType = WindowsRuntime]
+$null = [Windows.ApplicationModel.DataTransfer.ClipboardHistoryItemsResult, Windows.ApplicationModel.DataTransfer, ContentType = WindowsRuntime]
+$asTaskGeneric = $null
+foreach ($method in [System.WindowsRuntimeSystemExtensions].GetMethods()) {
+    if ($method.Name -ne "AsTask") { continue }
+    $params = $method.GetParameters()
+    if ($params.Count -ne 1) { continue }
+    if ($params[0].ParameterType.Name -like "IAsyncOperation*") {
+        $asTaskGeneric = $method
+        break
+    }
+}
+if ($null -eq $asTaskGeneric) { throw "AsTask IAsyncOperation not found" }
+function Await($WinRtTask, $ResultType) {
+    $asTask = $asTaskGeneric.MakeGenericMethod($ResultType)
+    $netTask = $asTask.Invoke($null, @($WinRtTask))
+    $netTask.Wait(-1) | Out-Null
+    $netTask.Result
+}
+$enabled = [Windows.ApplicationModel.DataTransfer.Clipboard]::IsHistoryEnabled()
+$items = New-Object System.Collections.Generic.List[string]
+if ($enabled) {
+    $result = Await ([Windows.ApplicationModel.DataTransfer.Clipboard]::GetHistoryItemsAsync()) ([Windows.ApplicationModel.DataTransfer.ClipboardHistoryItemsResult])
+    $textFormat = [Windows.ApplicationModel.DataTransfer.StandardDataFormats]::Text
+    foreach ($item in $result.Items) {
+        if (-not $item.Content.Contains($textFormat)) { continue }
+        try { $text = Await ($item.Content.GetTextAsync()) ([string]) } catch { continue }
+        if ($null -ne $text) { $items.Add($text) }
+    }
+}
+@{ enabled = [bool]$enabled; items = [string[]]@($items) } | ConvertTo-Json -Compress -Depth 5
+"""
 SECRET_RES = (
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
@@ -64,6 +104,68 @@ def dead_file() -> Path:
 
 def lock_file() -> Path:
     return state_dir() / "helper.lock"
+
+
+def sent_file() -> Path:
+    return state_dir() / "sent-hashes.json"
+
+
+def body_hash(body: str) -> str:
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+def load_sent_hashes() -> set[str]:
+    path = sent_file()
+    if not path.is_file():
+        return set()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return set()
+    if not isinstance(payload, list):
+        return set()
+    return {item for item in payload if isinstance(item, str)}
+
+
+def write_sent_hashes(hashes: set[str]) -> None:
+    ensure_state()
+    path = sent_file()
+    tmp = path.with_suffix(".tmp")
+    ordered = sorted(hashes)[-5000:]
+    tmp.write_text(json.dumps(ordered), encoding="utf-8")
+    if os.name != "nt":
+        tmp.chmod(0o600)
+    tmp.replace(path)
+    if os.name != "nt":
+        path.chmod(0o600)
+
+
+def unique_keep_last(bodies: list[str]) -> list[str]:
+    seen: set[str] = set()
+    kept: list[str] = []
+    for body in reversed(bodies):
+        if body in seen:
+            continue
+        seen.add(body)
+        kept.append(body)
+    kept.reverse()
+    return kept
+
+
+def select_bodies_to_post(payloads: list[str], sent: set[str], queued: set[str]) -> list[str]:
+    """Send unseen history, then the current clipboard even if it was sent before."""
+    payloads = unique_keep_last([body for body in payloads if body.strip()])
+    if not payloads:
+        return []
+    *older, current = payloads
+    chosen: list[str] = []
+    for body in older:
+        if body in queued or body_hash(body) in sent:
+            continue
+        chosen.append(body)
+    if current not in queued:
+        chosen.append(current)
+    return unique_keep_last(chosen)
 
 
 def load_environment() -> Path | None:
@@ -212,6 +314,66 @@ def read_clipboard() -> str | None:
         return result.stdout.decode("utf-8")
     except UnicodeDecodeError:
         return None
+
+
+def parse_windows_history_json(raw: str) -> tuple[bool | None, list[str]]:
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return None, []
+    if not isinstance(payload, dict):
+        return None, []
+    enabled = payload.get("enabled")
+    items = payload.get("items")
+    if items is None:
+        items = []
+    if isinstance(items, str):
+        items = [items]
+    if not isinstance(items, list):
+        return None, []
+    texts = [item for item in items if isinstance(item, str)]
+    if not isinstance(enabled, bool):
+        enabled = None
+    return enabled, texts
+
+
+def read_windows_history() -> tuple[bool | None, list[str]]:
+    encoded = base64.b64encode(WINDOWS_HISTORY_PS.encode("utf-16-le")).decode("ascii")
+    try:
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+            check=False,
+            capture_output=True,
+            timeout=20,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return None, []
+    if result.returncode != 0:
+        return None, []
+    try:
+        raw = result.stdout.decode("utf-8")
+    except UnicodeDecodeError:
+        return None, []
+    return parse_windows_history_json(raw.strip())
+
+
+def read_clipboard_payloads() -> list[str]:
+    """Windows: older history first, then the current clipboard. Else: current only."""
+    if os.environ.get("MELT_CLIPBOARD_CMD"):
+        text = read_clipboard()
+        return [text] if text is not None else []
+    current = read_clipboard()
+    if os.name != "nt":
+        return [current] if current is not None else []
+    _enabled, newest_first = read_windows_history()
+    older = list(reversed(newest_first[1:])) if len(newest_first) > 1 else []
+    if current is None and newest_first:
+        current = newest_first[0]
+    payloads: list[str] = list(older)
+    if current is not None:
+        payloads.append(current)
+    return payloads
 
 
 def ensure_state() -> None:
@@ -383,6 +545,15 @@ def doctor(catalog: dict) -> int:
     binaries = ("powershell.exe",) if os.name == "nt" else ("notify-send", "wl-paste", "xclip")
     for binary in binaries:
         print(f"{binary}: {shutil.which(binary) or 'missing'}")
+    if os.name == "nt":
+        enabled, items = read_windows_history()
+        if enabled is True:
+            state = "on"
+        elif enabled is False:
+            state = "off"
+        else:
+            state = "unread"
+        print(f"clipboard history: {state} ({len(items)} text)")
     api = os.environ.get("MELT_API_URL", "http://127.0.0.1:8080")
     try:
         with urllib.request.urlopen(api.rstrip("/") + "/healthz", timeout=3) as resp:
@@ -397,7 +568,7 @@ def doctor(catalog: dict) -> int:
     return 0
 
 
-def capture_body(args: argparse.Namespace, catalog: dict, no_notify: bool) -> str | None:
+def capture_bodies(args: argparse.Namespace, catalog: dict, no_notify: bool) -> list[str] | None:
     if args.stdin:
         data = sys.stdin.read()
         try:
@@ -405,12 +576,52 @@ def capture_body(args: argparse.Namespace, catalog: dict, no_notify: bool) -> st
         except UnicodeEncodeError:
             toast_for(catalog, "clipboard_empty", no_notify)
             return None
-        return data
-    text = read_clipboard()
-    if text is None or not text.strip():
+        if not data.strip():
+            toast_for(catalog, "clipboard_empty", no_notify)
+            return None
+        return [data]
+    payloads = read_clipboard_payloads()
+    queued = {row.get("body") for row in load_failed() if isinstance(row.get("body"), str)}
+    bodies = select_bodies_to_post(payloads, load_sent_hashes(), queued)
+    if not bodies:
+        if any(body.strip() for body in payloads):
+            return []
         toast_for(catalog, "clipboard_empty", no_notify)
         return None
-    return text
+    return bodies
+
+
+def queue_capture(status: int, kind: str, body: str, key: str) -> None:
+    if status in {400, 413}:
+        append_jsonl(
+            dead_file(),
+            {
+                "ts": time.time(),
+                "kind": kind,
+                "body": body if status != 413 else "",
+                "idempotency_key": key,
+                "error": status,
+            },
+        )
+        return
+    append_jsonl(
+        failed_file(),
+        {
+            "ts": time.time(),
+            "kind": kind,
+            "body": body,
+            "idempotency_key": key,
+            "error": status,
+        },
+    )
+
+
+def toast_saved(catalog: dict, saved: int, last_occ: int, no_notify: bool) -> None:
+    if saved > 1:
+        notify(catalog, t(catalog, "toast.saved_batch", n=saved), "", no_notify)
+        return
+    msg = t(catalog, "toast.saved_nth", n=last_occ) if last_occ > 1 else t(catalog, "toast.saved")
+    notify(catalog, msg, "", no_notify)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -449,63 +660,62 @@ def main(argv: list[str] | None = None) -> int:
         if not replay_queue(catalog, api, token, args.no_notify):
             toast_for(catalog, "auth" if not token else "api_unreachable", args.no_notify)
             return 1
-        body = capture_body(args, catalog, args.no_notify)
-        if body is None:
+        bodies = capture_bodies(args, catalog, args.no_notify)
+        if bodies is None:
             return 1
-        trimmed = body.strip()
-        if not trimmed:
-            toast_for(catalog, "clipboard_empty", args.no_notify)
+        if not bodies:
+            return 0
+        sent = load_sent_hashes()
+        saved = 0
+        last_occ = 1
+        skipped_secret = 0
+        skipped_large = 0
+        for index, body in enumerate(bodies):
+            if len(body.encode("utf-8")) > MAX_BYTES:
+                append_jsonl(
+                    dead_file(),
+                    {
+                        "ts": time.time(),
+                        "kind": infer_kind(body),
+                        "body": "",
+                        "idempotency_key": str(uuid.uuid4()),
+                        "error": "too_large",
+                    },
+                )
+                skipped_large += 1
+                continue
+            if not allow and looks_like_secret(body):
+                skipped_secret += 1
+                continue
+            kind = infer_kind(body)
+            key = str(uuid.uuid4())
+            status, payload = post_capture(api, token, kind, body, key)
+            if 200 <= status < 300:
+                saved += 1
+                last_occ = int(payload.get("occurrence_count") or 1)
+                sent.add(body_hash(body))
+                write_sent_hashes(sent)
+                continue
+            if status in {400, 413}:
+                queue_capture(status, kind, body, key)
+                continue
+            queue_capture(status, kind, body, key)
+            for rest in bodies[index + 1 :]:
+                queue_capture(status, infer_kind(rest), rest, str(uuid.uuid4()))
+            if saved:
+                toast_saved(catalog, saved, last_occ, args.no_notify)
+            toast_for(catalog, classify_status(status), args.no_notify)
             return 1
-        if len(body.encode("utf-8")) > MAX_BYTES:
-            append_jsonl(
-                dead_file(),
-                {
-                    "ts": time.time(),
-                    "kind": infer_kind(body),
-                    "body": "",
-                    "idempotency_key": str(uuid.uuid4()),
-                    "error": "too_large",
-                },
-            )
-            toast_for(catalog, "too_large", args.no_notify)
-            return 1
-        if not allow and looks_like_secret(body):
+        if saved:
+            toast_saved(catalog, saved, last_occ, args.no_notify)
+            return 0
+        if skipped_secret:
             toast_for(catalog, "secret_blocked", args.no_notify)
             return 1
-        kind = infer_kind(body)
-        key = str(uuid.uuid4())
-        status, payload = post_capture(api, token, kind, body, key)
-        if 200 <= status < 300:
-            occ = int(payload.get("occurrence_count") or 1)
-            msg = t(catalog, "toast.saved_nth", n=occ) if occ > 1 else t(catalog, "toast.saved")
-            notify(catalog, msg, "", args.no_notify)
-            return 0
-        code = classify_status(status)
-        if status in {400, 413}:
-            append_jsonl(
-                dead_file(),
-                {
-                    "ts": time.time(),
-                    "kind": kind,
-                    "body": body if status != 413 else "",
-                    "idempotency_key": key,
-                    "error": status,
-                },
-            )
-        else:
-            # Includes 401/403. The token can be fixed; the clipboard cannot be
-            # read again, so the body has to survive until the next hotkey press.
-            append_jsonl(
-                failed_file(),
-                {
-                    "ts": time.time(),
-                    "kind": kind,
-                    "body": body,
-                    "idempotency_key": key,
-                    "error": status,
-                },
-            )
-        toast_for(catalog, code, args.no_notify)
+        if skipped_large:
+            toast_for(catalog, "too_large", args.no_notify)
+            return 1
+        toast_for(catalog, "clipboard_empty", args.no_notify)
         return 1
     finally:
         release_lock(fd)

@@ -29,3 +29,8 @@ def allowed_hosts() -> frozenset[str]:
     """
     raw = os.environ.get("MELT_ALLOWED_HOSTS", "127.0.0.1,localhost")
     return frozenset(h.strip() for h in raw.split(",") if h.strip())
+
+
+def trust_proxy() -> bool:
+    """Honor X-Forwarded-Proto when TLS terminates in front of melt."""
+    return os.environ.get("MELT_TRUST_PROXY", "0") == "1"
