@@ -4,6 +4,8 @@ Clipboard capture for later. The source stays as you copied it. The digest is a 
 
 Phase 1 is one FastAPI process, SQLite, a host helper, and an inbox at `http://127.0.0.1:8080`. No worker, no page snapshots, no LLM yet.
 
+After capture, open the inbox and type a one-line **useful for** under the source (`n` focuses the field). Search uses your words as well as the clipboard text. The list title stays the source preview; the digest stays a derived stub.
+
 ## Quickstart
 
 ```bash
@@ -91,6 +93,8 @@ curl -sS -X POST http://127.0.0.1:8080/v1/captures \
 | POST | `/v1/captures` |
 | GET | `/v1/search?q=` |
 | GET | `/v1/sources/{id}` |
+| POST | `/v1/sources/{id}/context` |
+| POST | `/v1/sources/{id}/context-form` |
 | POST | `/v1/sources/{id}/reuse` |
 | POST | `/v1/captures/undo` |
 | DELETE | `/v1/captures/{id}` |

@@ -18,6 +18,10 @@ No `text/plain` on the clipboard (empty, image, or HTML-only). Copy text and ret
 
 Body is over 1 MiB UTF-8. Shrink it. The helper writes a dead-letter line with an empty body.
 
+## too_long
+
+The useful-for line is over 200 Unicode characters after NFC and newline folding. Shorten it. The source is unchanged.
+
 ## secret_blocked
 
 The body matched a built-in token pattern (`ghp_`, `AKIA`, PEM, Slack, GitHub PAT). Set `MELT_ALLOW_SECRETS=1` or pass `--allow-secrets` if you really want to store it.

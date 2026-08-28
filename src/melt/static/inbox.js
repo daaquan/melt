@@ -35,7 +35,16 @@
   });
 
   document.addEventListener("keydown", function (event) {
-    if (event.target.tagName === "INPUT") return;
+    if (event.isComposing) return;
+    var tag = event.target.tagName;
+    if (tag === "INPUT" || tag === "TEXTAREA") return;
     if (event.key === "c" && copyBtn) copyBtn.click();
+    if (event.key === "n") {
+      var field = document.getElementById("context-body");
+      if (field) {
+        event.preventDefault();
+        field.focus();
+      }
+    }
   });
 })();

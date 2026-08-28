@@ -7,6 +7,7 @@ import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated
+from urllib.parse import urlencode
 
 from fastapi import Depends, FastAPI, Form, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
@@ -16,6 +17,7 @@ from pydantic import BaseModel, Field
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from melt import config
+
 from melt.db import (
     HashConflict,
     IdempotencyConflict,
@@ -27,10 +29,12 @@ from melt.db import (
     recency_list,
     search_sources,
     source_detail,
+    source_matches_query,
     undo_latest,
+    upsert_context,
 )
 from melt.i18n import t, load_catalog
-from melt.normalize import NormalizeError, infer_kind, normalize
+from melt.normalize import NormalizeError, infer_kind, normalize, normalize_context
 from melt.secrets import looks_like_secret
 
 log = logging.getLogger("melt")
@@ -279,7 +283,63 @@ def api_source(
             "prompt_id": digest["prompt_id"],
         },
         "captured_at": [row["captured_at"] for row in detail["captures"]],
+        "context": detail["context"],
     }
+
+
+class ContextIn(BaseModel):
+    body: str = ""
+
+
+def _prepare_context(raw: str) -> tuple[str | None, str | None]:
+    """Normalize the useful-for line. Returns (body, error_code)."""
+    try:
+        body = normalize_context(raw)
+    except NormalizeError as exc:
+        if exc.code == "too_long":
+            return None, "too_long"
+        raise
+    if body and not config.allow_secrets() and looks_like_secret(body):
+        return None, "secret_blocked"
+    return body, None
+
+
+@app.post("/v1/sources/{source_id}/context")
+def api_context(
+    source_id: str,
+    payload: ContextIn,
+    request: Request,
+    conn: sqlite3.Connection = Depends(get_conn),
+    authorization: Annotated[str | None, Header()] = None,
+) -> Response:
+    require_auth(request, authorization)
+    if source_detail(conn, source_id) is None:
+        raise HTTPException(status_code=404, detail=_problem("not_found", "source missing", 404))
+    body, err = _prepare_context(payload.body)
+    if err:
+        raise HTTPException(status_code=400, detail=_problem(err, err, 400))
+    upsert_context(conn, source_id, body or "")
+    return Response(status_code=204)
+
+
+@app.post("/v1/sources/{source_id}/context-form")
+def context_form(
+    source_id: str,
+    request: Request,
+    body: Annotated[str, Form()] = "",
+    q: Annotated[str, Form()] = "",
+    conn: sqlite3.Connection = Depends(get_conn),
+    authorization: Annotated[str | None, Header()] = None,
+) -> Response:
+    if not is_authed(request, authorization):
+        return RedirectResponse("/", status_code=302)
+    if source_detail(conn, source_id) is None:
+        return RedirectResponse("/", status_code=303)
+    prepared, err = _prepare_context(body)
+    if err:
+        return _inbox_redirect(source_id, q, conn, error=err)
+    upsert_context(conn, source_id, prepared or "")
+    return _inbox_redirect(source_id, q, conn)
 
 
 class ReuseIn(BaseModel):
@@ -328,11 +388,28 @@ def api_delete(
     return {"ok": True, "result": result}
 
 
+def _inbox_redirect(
+    source_id: str,
+    q: str,
+    conn: sqlite3.Connection,
+    *,
+    error: str | None = None,
+) -> RedirectResponse:
+    """303 back to the inbox. Keep `q` only if this source still MATCHES it."""
+    params: dict[str, str] = {"selected": source_id}
+    if error:
+        params["context_error"] = error
+    if q and source_matches_query(conn, source_id, q):
+        params["q"] = q
+    return RedirectResponse("/?" + urlencode(params), status_code=303)
+
+
 @app.get("/", response_class=HTMLResponse)
 def inbox(
     request: Request,
     q: str = Query(default=""),
     selected: str | None = None,
+    context_error: str | None = None,
     conn: sqlite3.Connection = Depends(get_conn),
     authorization: Annotated[str | None, Header()] = None,
 ) -> HTMLResponse:
@@ -342,6 +419,8 @@ def inbox(
             "login.html",
             {"error": None, "t": t, "catalog": getattr(request.app.state, "catalog", {})},
         )
+    if context_error not in {"too_long", "secret_blocked"}:
+        context_error = None
     rows = recency_list(conn) if not q else search_sources(conn, q)
     catalog = request.app.state.catalog
     current = None
@@ -355,6 +434,8 @@ def inbox(
         "inbox.html",
         {
             "q": q,
+            "selected": selected,
+            "context_error": context_error,
             "rows": rows,
             "current": current,
             "t": t,

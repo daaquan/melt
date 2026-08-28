@@ -10,7 +10,7 @@
     <div class="mark">{{ t("app.name", catalog) }}</div>
     <form class="search" method="get" action="/">
       <label class="visually-hidden" for="q">{{ t("search.placeholder", catalog) }}</label>
-      <input id="q" name="q" value="{{ q }}" placeholder="{{ t("search.placeholder", catalog) }}" autofocus />
+      <input id="q" name="q" value="{{ q }}" placeholder="{{ t("search.placeholder", catalog) }}"{% if not selected %} autofocus{% endif %} />
     </form>
   </header>
   <main>
@@ -31,6 +31,7 @@
           <div>{{ title }}</div>
           <div class="meta">
             {% if row.occ > 1 %}<span class="occ">{{ t("list.captured_n", catalog, n=row.occ|string) }}</span>{% endif %}
+            {% if row.context_body %}<span class="context-meta">{{ row.context_body[:80] }}</span>{% endif %}
           </div>
         </a>
       {% endfor %}
@@ -48,6 +49,21 @@
           {% if raw|length > display_chars %}
           <p class="meta">{{ t("digest.truncated", catalog, shown=display_chars|string, total=raw|length|string) }}</p>
           {% endif %}
+          <form class="context-form" method="post" action="/v1/sources/{{ current.source.id }}/context-form">
+            <input type="hidden" name="q" value="{{ q }}" />
+            <label for="context-body">{{ t("context.heading", catalog) }}</label>
+            {% if context_error %}
+            <p class="err">{{ t("error." ~ context_error ~ ".body", catalog) }}</p>
+            {% endif %}
+            <input
+              id="context-body"
+              name="body"
+              type="text"
+              value="{{ current.context or '' }}"
+              placeholder="{{ t("context.placeholder", catalog) }}"
+            />
+            <button type="submit">{{ t("context.save", catalog) }}</button>
+          </form>
         </article>
         <article class="pane digest">
           <h2>{{ t("digest.heading", catalog) }}</h2>

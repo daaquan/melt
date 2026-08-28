@@ -96,3 +96,22 @@ def fts_query(q: str) -> str | None:
     if not parts:
         return None
     return " AND ".join(parts)
+
+
+CONTEXT_MAX = 200
+
+
+def normalize_context(raw: str) -> str:
+    """One-line useful-for. Empty after this is a delete, not an error.
+
+    NFC, then newlines become spaces, then trim. Length is Unicode code
+    points (`len` of the str), not UTF-8 bytes — a short sentence cap, not
+    the 1 MiB ingest limit. Do not call `normalize()`; that path rejects empty
+    and is for source identity.
+    """
+    body = unicodedata.normalize("NFC", raw)
+    body = body.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+    body = body.strip()
+    if len(body) > CONTEXT_MAX:
+        raise NormalizeError("too_long", "context exceeds 200 characters")
+    return body

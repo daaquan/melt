@@ -66,6 +66,32 @@ main { display: grid; grid-template-columns: 280px 1fr; min-height: calc(100vh -
 
 .occ { border: 1px solid #888; padding: 0 4px; font-size: 0.75rem; }
 
+.context-meta { margin-left: 6px; }
+
+.context-form {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid #ddd;
+}
+
+.context-form label {
+  display: block;
+  font-size: 0.75rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  margin-bottom: 6px;
+}
+
+.context-form input[type="text"] {
+  width: 100%;
+  font: inherit;
+  padding: 8px 10px;
+  min-height: 44px;
+  border: 1px solid #888;
+}
+
+.context-form button { margin-top: 8px; }
+
 .detail { padding: 16px; display: grid; grid-template-columns: 3fr 2fr; gap: 16px; }
 
 .pane { border: 1px solid #999; background: #fff; min-height: 360px; padding: 12px; }
