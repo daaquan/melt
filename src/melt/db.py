@@ -11,8 +11,6 @@ from melt.normalize import fts_query, source_hash, stub_phrases
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
-PRAGMA busy_timeout=30000;
-PRAGMA foreign_keys=ON;
 
 CREATE TABLE IF NOT EXISTS sources (
   id TEXT PRIMARY KEY,
@@ -57,14 +55,32 @@ CREATE VIRTUAL TABLE IF NOT EXISTS sources_fts USING fts5(
 """
 
 
+# journal_mode persists in the database file. These two are per connection.
+PRAGMAS = (
+    "PRAGMA busy_timeout=30000",
+    "PRAGMA foreign_keys=ON",
+)
+
+
 def connect(path: Path) -> sqlite3.Connection:
+    """Open a connection. Assumes init_db has already created the schema."""
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(
         path, check_same_thread=False, isolation_level=None, timeout=30
     )
     conn.row_factory = sqlite3.Row
-    conn.executescript(SCHEMA)
+    for pragma in PRAGMAS:
+        conn.execute(pragma)
     return conn
+
+
+def init_db(path: Path) -> None:
+    """Create the schema. Call this once at startup."""
+    conn = connect(path)
+    try:
+        conn.executescript(SCHEMA)
+    finally:
+        conn.close()
 
 
 def now_ms() -> int:

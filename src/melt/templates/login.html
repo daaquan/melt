@@ -3,35 +3,10 @@
 <head>
   <meta charset="utf-8" />
   <title>{{ t("login.title", catalog) }}</title>
-  <style>
-    body {
-      font-family: "IBM Plex Sans", "Liberation Sans", sans-serif;
-      background: #fafafa;
-      color: #222;
-      margin: 0;
-    }
-    form {
-      max-width: 28rem;
-      margin: 12vh auto;
-      padding: 1.5rem;
-      border: 1px solid #bbb;
-      background: #fff;
-    }
-    label { display: block; margin-bottom: 0.35rem; }
-    input {
-      width: 100%;
-      box-sizing: border-box;
-      font: inherit;
-      padding: 0.6rem;
-      margin-bottom: 0.75rem;
-    }
-    button { font: inherit; min-height: 44px; padding: 0 1rem; }
-    .hint { color: #666; font-size: 0.9rem; }
-    .err { color: #7a1f1f; margin-bottom: 0.75rem; }
-  </style>
+  <link rel="stylesheet" href="/static/app.css" />
 </head>
 <body>
-  <form method="post" action="/v1/login">
+  <form class="login-form" method="post" action="/v1/login">
     <h1>{{ t("login.title", catalog) }}</h1>
     {% if error %}
     <p class="err">{{ t("login.error", catalog) }}</p>

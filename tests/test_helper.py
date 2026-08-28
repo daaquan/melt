@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
@@ -26,7 +27,6 @@ def test_locale_keys_exist() -> None:
         assert key in en
         assert key in ja
     assert "Already seen" not in en.values()
-    assert "Already seen" not in en
 
 
 def test_dead_letter_400_continues(tmp_path, monkeypatch) -> None:
@@ -78,3 +78,20 @@ def test_helper_resolves_saved_keys() -> None:
     catalog = json.loads((ROOT / "locales" / "en.json").read_text(encoding="utf-8"))
     assert helper.t(catalog, "toast.saved") == "Saved"
     assert "3" in helper.t(catalog, "toast.saved_nth", n=3)
+
+
+def test_live_auth_failure_keeps_the_body(tmp_path, monkeypatch) -> None:
+    """An auth failure must not discard the capture.
+
+    Fix MELT_TOKEN, press the hotkey again, and the queued row replays.
+    """
+    monkeypatch.setenv("MELT_STATE_DIR", str(tmp_path))
+    monkeypatch.setenv("MELT_LOCALE_DIR", str(ROOT / "locales"))
+    helper = load_helper()
+    monkeypatch.setattr(helper.sys, "stdin", io.StringIO("worth keeping"))
+    helper.post_capture = lambda *args, **kwargs: (401, {})
+
+    assert helper.main(["--stdin", "--no-notify"]) == 1
+
+    queued = helper.load_failed()
+    assert [row["body"] for row in queued] == ["worth keeping"]

@@ -3,12 +3,14 @@ from __future__ import annotations
 import logging
 import secrets as pysecrets
 import sqlite3
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, Form, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -20,6 +22,7 @@ from melt.db import (
     connect,
     delete_capture,
     ingest,
+    init_db,
     mark_reuse,
     recency_list,
     search_sources,
@@ -36,6 +39,10 @@ logging.basicConfig(level=logging.INFO)
 ROOT = Path(__file__).resolve().parent
 TEMPLATES = Jinja2Templates(directory=str(ROOT / "templates"))
 TEMPLATES.env.autoescape = True
+
+# `default-src 'self'` rejects inline <style>/<script>, so the inbox loads both
+# from /static. Keep it that way when editing the templates.
+CSP = "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
 
 DISPLAY_CHARS = 20_000
 LOGIN_MAX = 4096
@@ -57,7 +64,9 @@ class SizeLimitMiddleware(BaseHTTPMiddleware):
             if n > limit:
                 return JSONResponse(
                     status_code=413,
-                    content=_problem("too_large", "body exceeds 1 MiB", 413),
+                    content=_problem(
+                        "too_large", f"body exceeds {config.max_bytes()} bytes", 413
+                    ),
                 )
         return await call_next(request)
 
@@ -70,6 +79,17 @@ def _problem(code: str, detail: str, status: int) -> dict:
         "detail": detail,
         "code": code,
     }
+
+
+def token_matches(given: str, expected: str) -> bool:
+    """Constant-time compare.
+
+    secrets.compare_digest raises TypeError on non-ASCII str, and both the login
+    form and the cookie carry attacker-controlled text, so compare bytes.
+    """
+    if not expected:
+        return False
+    return pysecrets.compare_digest(given.encode("utf-8"), expected.encode("utf-8"))
 
 
 def get_conn():
@@ -85,11 +105,10 @@ def is_authed(request: Request, authorization: str | None) -> bool:
     if not token:
         return False
     if authorization and authorization.startswith("Bearer "):
-        given = authorization.removeprefix("Bearer ")
-        if pysecrets.compare_digest(given, token):
+        if token_matches(authorization.removeprefix("Bearer "), token):
             return True
     cookie = request.cookies.get(config.COOKIE_NAME, "")
-    return bool(cookie) and pysecrets.compare_digest(cookie, token)
+    return bool(cookie) and token_matches(cookie, token)
 
 
 def require_auth(
@@ -104,26 +123,40 @@ def require_auth(
 async def lifespan(app: FastAPI):
     if not config.token():
         log.warning("MELT_TOKEN is empty; all auth will fail")
-    app.state.conn = connect(config.db_path())
+    init_db(config.db_path())
     app.state.catalog = load_catalog()
-    try:
-        yield
-    finally:
-        app.state.conn.close()
+    yield
 
 
 app = FastAPI(title="melt", docs_url=None, redoc_url=None, lifespan=lifespan)
 app.add_middleware(SizeLimitMiddleware)
+app.mount("/static", StaticFiles(directory=str(ROOT / "static")), name="static")
+
+
+@app.exception_handler(HTTPException)
+async def problem_response(request: Request, exc: HTTPException) -> JSONResponse:
+    """Return the problem object itself, not FastAPI's {"detail": ...} wrapper.
+
+    Routes and SizeLimitMiddleware then agree on one error shape, so a client
+    can always read `code` off the top level.
+    """
+    body = (
+        exc.detail
+        if isinstance(exc.detail, dict)
+        else _problem("error", str(exc.detail), exc.status_code)
+    )
+    return JSONResponse(status_code=exc.status_code, content=body, headers=exc.headers)
 
 
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
-    host = request.headers.get("host", "")
-    hostname = host.split(":")[0]
-    if hostname not in {"127.0.0.1", "localhost", "testserver"}:
+    hostname = request.headers.get("host", "").split(":")[0]
+    if hostname not in config.allowed_hosts():
         return JSONResponse(status_code=400, content=_problem("bad_host", "host not allowed", 400))
     response: Response = await call_next(request)
-    response.headers["Content-Security-Policy"] = "default-src 'self'"
+    response.headers["Content-Security-Policy"] = CSP
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "no-referrer"
     return response
 
 
@@ -153,7 +186,7 @@ def post_capture(
             status_code=400,
             detail=_problem("secret_blocked", "body looks like a secret", 400),
         )
-    key = idempotency_key or str(__import__("uuid").uuid4())
+    key = idempotency_key or str(uuid.uuid4())
     try:
         kind, normalized = normalize(kind, body)
     except NormalizeError as exc:
@@ -333,7 +366,7 @@ def inbox(
 
 @app.post("/v1/login")
 def login(request: Request, token: Annotated[str, Form()] = "") -> Response:
-    if not config.token() or not pysecrets.compare_digest(token, config.token()):
+    if not token_matches(token, config.token()):
         return TEMPLATES.TemplateResponse(
             request,
             "login.html",

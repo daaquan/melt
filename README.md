@@ -33,6 +33,7 @@ If the helper prints `Failed`, run `python3 scripts/melt-capture --doctor`.
 | `MELT_LOCALE_DIR` | API and helper | walk up from the file to `locales/` |
 | `MELT_STATE_DIR` | helper | `$XDG_STATE_HOME/melt` or `~/.local/state/melt` |
 | `MELT_ALLOW_SECRETS` | both | `0` (set `1` to store token-like text) |
+| `MELT_ALLOWED_HOSTS` | API | `127.0.0.1,localhost` (the `Host` allowlist) |
 | `MELT_CLIPBOARD_CMD` | helper | `wl-paste` on Wayland, else `xclip` |
 | `MELT_NOTIFY_CMD` | helper | `notify-send` |
 
@@ -95,7 +96,9 @@ curl -sS -X POST http://127.0.0.1:8080/v1/captures \
 | DELETE | `/v1/captures/{id}` |
 | GET | `/` inbox |
 
-Errors use a `code` field. See [docs/troubleshooting.md](docs/troubleshooting.md).
+Every error, from a route or from the size middleware, is one flat JSON object with `type`, `title`, `status`, `detail`, and `code`. Match on `code`. See [docs/troubleshooting.md](docs/troubleshooting.md).
+
+The API answers only on `127.0.0.1` and `localhost`, which is what keeps a browser on some other page from talking to it. `MELT_ALLOWED_HOSTS` widens that if you knowingly bind past loopback.
 
 ## Dev without Docker
 

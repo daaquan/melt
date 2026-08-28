@@ -1,6 +1,6 @@
 # Troubleshooting
 
-API errors include a `code`. Helper toasts use the matching `error.<code>.*` keys in `locales/en.json`.
+Every API error is one flat JSON object: `type`, `title`, `status`, `detail`, `code`. Helper toasts use the matching `error.<code>.*` keys in `locales/en.json`.
 
 ## auth
 
@@ -56,7 +56,7 @@ No such source or capture.
 
 ## bad_host
 
-`Host` was not `127.0.0.1` or `localhost`. Compose publishes localhost only.
+`Host` was not in `MELT_ALLOWED_HOSTS`, which defaults to `127.0.0.1,localhost`. Compose publishes localhost only. Reaching the API under another name means adding it to that list.
 
 ## bad_reuse
 

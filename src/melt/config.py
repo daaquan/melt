@@ -20,3 +20,12 @@ def db_path() -> Path:
 
 def allow_secrets() -> bool:
     return os.environ.get("MELT_ALLOW_SECRETS", "0") == "1"
+
+
+def allowed_hosts() -> frozenset[str]:
+    """Host header allowlist. This is the DNS rebinding guard.
+
+    Widen it only if you knowingly bind past loopback.
+    """
+    raw = os.environ.get("MELT_ALLOWED_HOSTS", "127.0.0.1,localhost")
+    return frozenset(h.strip() for h in raw.split(",") if h.strip())

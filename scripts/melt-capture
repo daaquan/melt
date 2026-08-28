@@ -7,6 +7,7 @@ import fcntl
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -214,8 +215,7 @@ def classify_status(status: int) -> str:
     if status in {401, 403}:
         return "auth"
     if status in {400, 409}:
-        code = "generic"
-        return code
+        return "generic"
     if status == 413:
         return "too_large"
     if status == 0 or status >= 500:
@@ -268,13 +268,12 @@ def doctor(catalog: dict) -> int:
     print(f"token set: {'yes' if os.environ.get('MELT_TOKEN') else 'no'}")
     print(f"failed.jsonl: {failed_file()}")
     for binary in ("notify-send", "wl-paste", "xclip"):
-        path = subprocess.getoutput(f"command -v {binary}")
-        print(f"{binary}: {path or 'missing'}")
+        print(f"{binary}: {shutil.which(binary) or 'missing'}")
     api = os.environ.get("MELT_API_URL", "http://127.0.0.1:8080")
     try:
         with urllib.request.urlopen(api.rstrip("/") + "/healthz", timeout=3) as resp:
             print(f"healthz: {resp.status}")
-    except Exception as exc:  # noqa: BLE001 — doctor must print any failure
+    except Exception as exc:  # noqa: BLE001: doctor must print any failure
         print(f"healthz: {exc}")
         return 1
     if not catalog:
@@ -368,7 +367,9 @@ def main(argv: list[str] | None = None) -> int:
                     "error": status,
                 },
             )
-        elif status not in {401, 403}:
+        else:
+            # Includes 401/403. The token can be fixed; the clipboard cannot be
+            # read again, so the body has to survive until the next hotkey press.
             append_jsonl(
                 failed_file(),
                 {
