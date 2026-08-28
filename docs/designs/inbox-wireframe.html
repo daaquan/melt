@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>melt — inbox sketch</title>
+  <style>
+    /* Intentionally rough: system fonts, gray lines, no color. Sketch not mockup. */
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      font-size: 13px;
+      color: #222;
+      background: #fafafa;
+    }
+    header {
+      border-bottom: 1px solid #bbb;
+      padding: 12px 16px;
+      display: flex;
+      align-items: baseline;
+      gap: 16px;
+    }
+    header .mark { font-weight: 700; letter-spacing: 0.08em; }
+    header .note { color: #666; font-size: 11px; }
+    .search {
+      flex: 1;
+      border: 1px dashed #888;
+      padding: 8px 10px;
+      background: #fff;
+    }
+    .search span { color: #999; }
+    main { display: grid; grid-template-columns: 280px 1fr; min-height: calc(100vh - 48px); }
+    .list { border-right: 1px solid #bbb; }
+    .row {
+      border-bottom: 1px dotted #ccc;
+      padding: 10px 12px;
+      cursor: default;
+    }
+    .row.active { outline: 1px dashed #444; background: #fff; }
+    .row .meta { color: #666; font-size: 11px; }
+    .row .occ { border: 1px solid #888; padding: 0 4px; font-size: 10px; }
+    .detail { padding: 16px; display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    .pane {
+      border: 1px solid #999;
+      background: #fff;
+      min-height: 360px;
+      padding: 12px;
+    }
+    .pane h2 {
+      margin: 0 0 8px;
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      border-bottom: 1px solid #ddd;
+      padding-bottom: 6px;
+    }
+    .derived-tag { float: right; font-size: 10px; border: 1px solid #888; padding: 1px 5px; }
+    .actions { grid-column: 1 / -1; display: flex; gap: 8px; }
+    button {
+      font: inherit;
+      background: #fff;
+      border: 1px solid #444;
+      padding: 6px 10px;
+    }
+    .empty-hint { color: #888; font-size: 11px; margin-top: 24px; }
+    /* Design: source and digest never share a visual weight. Source is the truth column. */
+  </style>
+</head>
+<body>
+  <!-- Hierarchy: search first (reuse), then which capture, then source vs derived side by side. -->
+  <header>
+    <div class="mark">melt</div>
+    <div class="search"><span>Search half-remembered words… e.g. “that sqlite wal trick”</span></div>
+    <div class="note">sketch · no chrome · no tags</div>
+  </header>
+  <main>
+    <section class="list">
+      <div class="row active">
+        <div>SQLite WAL checkpoint under load</div>
+        <div class="meta">today 21:04 · <span class="occ">captured 3 times</span></div>
+      </div>
+      <div class="row">
+        <div>Karakeep architecture notes</div>
+        <div class="meta">yesterday 11:12</div>
+      </div>
+      <div class="row">
+        <div>https://paulgraham.com/schlep.html</div>
+        <div class="meta">Aug 25 · URL</div>
+      </div>
+      <p class="empty-hint" style="padding:12px">Empty state (if zero items):<br/>“Copy anything. Press the hotkey. Nothing to file.”</p>
+    </section>
+    <section class="detail">
+      <article class="pane">
+        <h2>Source · immutable</h2>
+        <p>When the WAL is large, a checkpoint can stall writers. The advice was to checkpoint more often under read-heavy load, not to disable WAL.</p>
+        <p class="meta" style="color:#666">hash sha256:9f2c… · captured 2026-08-27 21:04 (also 08-20, 08-14)</p>
+      </article>
+      <article class="pane">
+        <h2>Digest <span class="derived-tag">derived · not truth</span></h2>
+        <p><strong>Summary.</strong> WAL checkpoints can block writers if allowed to grow; frequency beats turning WAL off.</p>
+        <p><strong>Useful for</strong></p>
+        <ul>
+          <li>SQLite-backed ingest worker under concurrent captures</li>
+        </ul>
+        <p class="meta" style="color:#666">model: unconfigured · prompt: digest-v1 · regenerate later</p>
+      </article>
+      <div class="actions">
+        <button>Copy source</button>
+        <button>Mark as used</button>
+        <!-- Loading: list shows “Saving…” toast from hotkey, not a spinner on this page. -->
+        <!-- Error: Failed capture stays on the machine until retry; this page never loses source. -->
+        <!-- Partial: digest missing → right pane says “Digest pending” and source still readable. -->
+      </div>
+    </section>
+  </main>
+</body>
+</html>
