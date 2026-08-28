@@ -1,0 +1,390 @@
+#!/usr/bin/env python3
+"""Host capture helper. Stdlib only so it runs without installing melt."""
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+import uuid
+from pathlib import Path
+
+MAX_BYTES = int(os.environ.get("MELT_MAX_BYTES", "1048576"))
+URL_RE = re.compile(r"^https?://\S+$")
+SECRET_RES = (
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(r"\bghp_[A-Za-z0-9]{36,}\b"),
+    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"),
+    re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"),
+)
+
+def state_dir() -> Path:
+    override = os.environ.get("MELT_STATE_DIR")
+    if override:
+        return Path(override)
+    xdg = os.environ.get("XDG_STATE_HOME")
+    base = Path(xdg) if xdg else Path.home() / ".local/state"
+    return base / "melt"
+
+
+def failed_file() -> Path:
+    return state_dir() / "failed.jsonl"
+
+
+def dead_file() -> Path:
+    return state_dir() / "failed.dead.jsonl"
+
+
+def lock_file() -> Path:
+    return state_dir() / "helper.lock"
+
+
+def locale_dir() -> Path | None:
+    env = os.environ.get("MELT_LOCALE_DIR")
+    if env:
+        path = Path(env)
+        return path if path.is_dir() else None
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        candidate = parent / "locales"
+        if (candidate / "en.json").is_file():
+            return candidate
+    return None
+
+
+def load_catalog() -> dict:
+    directory = locale_dir()
+    if directory is None:
+        return {}
+    path = directory / "en.json"
+    if not path.is_file():
+        return {}
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def t(catalog: dict, key: str, **kwargs: object) -> str:
+    value = catalog.get(key, key)
+    if kwargs:
+        try:
+            return str(value).format(**kwargs)
+        except (KeyError, IndexError):
+            return str(value)
+    return str(value)
+
+
+def looks_like_secret(text: str) -> bool:
+    return any(pattern.search(text) for pattern in SECRET_RES)
+
+
+def infer_kind(body: str) -> str:
+    return "url" if URL_RE.match(body.strip()) else "text"
+
+
+def notify(catalog: dict, title: str, body: str, no_notify: bool) -> None:
+    if no_notify:
+        print(f"{title}: {body}")
+        return
+    cmd = os.environ.get("MELT_NOTIFY_CMD", "notify-send")
+    try:
+        subprocess.run([cmd, title, body], check=False, timeout=5)
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        print(f"{title}: {body}", file=sys.stderr)
+
+
+def read_clipboard() -> str | None:
+    override = os.environ.get("MELT_CLIPBOARD_CMD")
+    if override:
+        argv = override.split()
+    elif os.environ.get("WAYLAND_DISPLAY"):
+        argv = ["wl-paste", "--type", "text/plain"]
+    else:
+        argv = ["xclip", "-selection", "clipboard", "-t", "text/plain", "-o"]
+    try:
+        result = subprocess.run(
+            argv, check=False, capture_output=True, timeout=5
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        return result.stdout.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def ensure_state() -> None:
+    path = state_dir()
+    path.mkdir(parents=True, exist_ok=True)
+    path.chmod(0o700)
+
+
+def acquire_lock() -> int | None:
+    ensure_state()
+    fd = os.open(lock_file(), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def append_jsonl(path: Path, obj: dict) -> None:
+    ensure_state()
+    line = json.dumps(obj, ensure_ascii=False) + "\n"
+    fd = os.open(path, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        os.write(fd, line.encode("utf-8"))
+    finally:
+        os.close(fd)
+
+
+def load_failed() -> list[dict]:
+    path = failed_file()
+    if not path.is_file():
+        return []
+    rows: list[dict] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError:
+            append_jsonl(dead_file(), {"ts": time.time(), "kind": "torn", "body": line, "error": "torn"})
+    return rows
+
+
+def write_failed(rows: list[dict]) -> None:
+    ensure_state()
+    path = failed_file()
+    tmp = path.with_suffix(".tmp")
+    payload = "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows)
+    tmp.write_text(payload, encoding="utf-8")
+    tmp.chmod(0o600)
+    tmp.replace(path)
+    path.chmod(0o600)
+
+
+def collapse_failed(rows: list[dict]) -> list[dict]:
+    seen: dict[str, dict] = {}
+    order: list[str] = []
+    for row in rows:
+        key = row.get("idempotency_key") or str(uuid.uuid4())
+        if key not in seen:
+            order.append(key)
+        seen[key] = row
+    return [seen[key] for key in order]
+
+
+def post_capture(api: str, token: str, kind: str, body: str, key: str) -> tuple[int, dict]:
+    req = urllib.request.Request(
+        api.rstrip("/") + "/v1/captures",
+        data=json.dumps({"kind": kind, "body": body}).encode("utf-8"),
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Idempotency-Key": key,
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            payload = json.loads(resp.read().decode("utf-8") or "{}")
+            return resp.status, payload
+    except urllib.error.HTTPError as exc:
+        try:
+            payload = json.loads(exc.read().decode("utf-8") or "{}")
+        except json.JSONDecodeError:
+            payload = {}
+        return exc.code, payload
+    except urllib.error.URLError as exc:
+        return 0, {"error": str(exc.reason)}
+
+
+def classify_status(status: int) -> str:
+    if status in {401, 403}:
+        return "auth"
+    if status in {400, 409}:
+        code = "generic"
+        return code
+    if status == 413:
+        return "too_large"
+    if status == 0 or status >= 500:
+        return "api_unreachable"
+    return "generic"
+
+
+def toast_for(catalog: dict, code: str, no_notify: bool) -> None:
+    title = t(catalog, f"error.{code}.title")
+    body = t(catalog, f"error.{code}.body")
+    if title == f"error.{code}.title":
+        title = t(catalog, "toast.failed")
+        body = code
+    notify(catalog, title, body, no_notify)
+
+
+def replay_queue(catalog: dict, api: str, token: str, no_notify: bool) -> bool:
+    """Replay failed.jsonl. Return False if live capture must be skipped."""
+    rows = collapse_failed(load_failed())
+    remaining: list[dict] = []
+    skip_live = False
+    i = 0
+    while i < len(rows):
+        row = rows[i]
+        status, payload = post_capture(
+            api, token, row.get("kind") or "text", row.get("body") or "", row["idempotency_key"]
+        )
+        if 200 <= status < 300:
+            occ = int(payload.get("occurrence_count") or 1)
+            msg = t(catalog, "toast.saved_nth", n=occ) if occ > 1 else t(catalog, "toast.saved")
+            notify(catalog, msg, "", no_notify)
+            i += 1
+            continue
+        if status in {400, 413}:
+            append_jsonl(dead_file(), {**row, "error": status})
+            i += 1
+            continue
+        remaining = rows[i:]
+        skip_live = True
+        break
+    else:
+        remaining = []
+    write_failed(remaining)
+    return not skip_live
+
+
+def doctor(catalog: dict) -> int:
+    print(f"locale: {locale_dir()}")
+    print(f"api: {os.environ.get('MELT_API_URL', 'http://127.0.0.1:8080')}")
+    print(f"token set: {'yes' if os.environ.get('MELT_TOKEN') else 'no'}")
+    print(f"failed.jsonl: {failed_file()}")
+    for binary in ("notify-send", "wl-paste", "xclip"):
+        path = subprocess.getoutput(f"command -v {binary}")
+        print(f"{binary}: {path or 'missing'}")
+    api = os.environ.get("MELT_API_URL", "http://127.0.0.1:8080")
+    try:
+        with urllib.request.urlopen(api.rstrip("/") + "/healthz", timeout=3) as resp:
+            print(f"healthz: {resp.status}")
+    except Exception as exc:  # noqa: BLE001 — doctor must print any failure
+        print(f"healthz: {exc}")
+        return 1
+    if not catalog:
+        print("locale catalog: missing")
+        return 1
+    print("locale catalog: ok")
+    return 0
+
+
+def capture_body(args: argparse.Namespace, catalog: dict, no_notify: bool) -> str | None:
+    if args.stdin:
+        data = sys.stdin.read()
+        try:
+            data.encode("utf-8")
+        except UnicodeEncodeError:
+            toast_for(catalog, "clipboard_empty", no_notify)
+            return None
+        return data
+    text = read_clipboard()
+    if text is None or not text.strip():
+        toast_for(catalog, "clipboard_empty", no_notify)
+        return None
+    return text
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="melt-capture")
+    parser.add_argument("--stdin", action="store_true", help="read payload from stdin")
+    parser.add_argument("--doctor", action="store_true")
+    parser.add_argument("--no-notify", action="store_true")
+    parser.add_argument("--allow-secrets", action="store_true")
+    args = parser.parse_args(argv)
+    catalog = load_catalog()
+    if args.doctor:
+        return doctor(catalog)
+    if not catalog:
+        notify({}, "locale_missing", "locale_missing", args.no_notify)
+        return 1
+
+    fd = acquire_lock()
+    if fd is None:
+        toast_for(catalog, "generic", args.no_notify)
+        return 1
+    try:
+        api = os.environ.get("MELT_API_URL", "http://127.0.0.1:8080")
+        token = os.environ.get("MELT_TOKEN", "")
+        allow = args.allow_secrets or os.environ.get("MELT_ALLOW_SECRETS") == "1"
+        if not replay_queue(catalog, api, token, args.no_notify):
+            toast_for(catalog, "auth" if not token else "api_unreachable", args.no_notify)
+            return 1
+        body = capture_body(args, catalog, args.no_notify)
+        if body is None:
+            return 1
+        trimmed = body.strip()
+        if not trimmed:
+            toast_for(catalog, "clipboard_empty", args.no_notify)
+            return 1
+        if len(body.encode("utf-8")) > MAX_BYTES:
+            append_jsonl(
+                dead_file(),
+                {
+                    "ts": time.time(),
+                    "kind": infer_kind(body),
+                    "body": "",
+                    "idempotency_key": str(uuid.uuid4()),
+                    "error": "too_large",
+                },
+            )
+            toast_for(catalog, "too_large", args.no_notify)
+            return 1
+        if not allow and looks_like_secret(body):
+            toast_for(catalog, "secret_blocked", args.no_notify)
+            return 1
+        kind = infer_kind(body)
+        key = str(uuid.uuid4())
+        status, payload = post_capture(api, token, kind, body, key)
+        if 200 <= status < 300:
+            occ = int(payload.get("occurrence_count") or 1)
+            msg = t(catalog, "toast.saved_nth", n=occ) if occ > 1 else t(catalog, "toast.saved")
+            notify(catalog, msg, "", args.no_notify)
+            return 0
+        code = classify_status(status)
+        if status in {400, 413}:
+            append_jsonl(
+                dead_file(),
+                {
+                    "ts": time.time(),
+                    "kind": kind,
+                    "body": body if status != 413 else "",
+                    "idempotency_key": key,
+                    "error": status,
+                },
+            )
+        elif status not in {401, 403}:
+            append_jsonl(
+                failed_file(),
+                {
+                    "ts": time.time(),
+                    "kind": kind,
+                    "body": body,
+                    "idempotency_key": key,
+                    "error": status,
+                },
+            )
+        toast_for(catalog, code, args.no_notify)
+        return 1
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
