@@ -20,11 +20,18 @@ dependencies = [
 dev = ["pytest>=8", "httpx>=0.27"]
 build = ["pyinstaller>=6"]
 
-[tool.setuptools.packages.find]
-where = ["src"]
+# ponytail: locales/ stays at the repo root for the helper and hotkeys;
+# the wheel maps it to melt/locales, which i18n.catalog_path() checks first.
+[tool.setuptools]
+packages = ["melt", "melt.locales"]
+
+[tool.setuptools.package-dir]
+"" = "src"
+"melt.locales" = "locales"
 
 [tool.setuptools.package-data]
 melt = ["templates/*.html", "static/*"]
+"melt.locales" = ["*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
