@@ -6,6 +6,7 @@ Phase 1: hotkey capture → stub digest → inbox search → mark used.
 Single FastAPI process, SQLite, host helper. No worker, snapshots, or LLM in the first tree.
 
 Design: `docs/designs/phase1-capture-digest.md`
+Inbox UI: `docs/designs/dioxus-inbox.md` (Dioxus/WASM client; `ui/` → `scripts/build-ui.sh`)
 
 ## Skill routing
 

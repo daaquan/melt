@@ -5,7 +5,6 @@ import sqlite3
 import threading
 import uuid
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
 
 import pytest
 
@@ -149,27 +148,14 @@ def test_empty_context_deletes_row_and_fts(client) -> None:
     assert misses.json()["hits"] == []
 
 
-def test_too_long_json_and_form(client) -> None:
+def test_too_long_is_rejected_and_keeps_the_old_line(client) -> None:
     source_id = _capture(client, "length check source")
     assert _post_context(client, source_id, "a" * 200).status_code == 204
-    over = client.post(
-        f"/v1/sources/{source_id}/context",
-        json={"body": "a" * 201},
-        headers=auth_headers(None),
-    )
+    _post_context(client, source_id, "kept-short")
+    over = _post_context(client, source_id, "b" * 201)
     assert over.status_code == 400
     assert over.json()["code"] == "too_long"
-    _post_context(client, source_id, "kept-short")
-    client.cookies.set("melt_token", TOKEN)
-    form = client.post(
-        f"/v1/sources/{source_id}/context-form",
-        data={"body": "b" * 201, "q": ""},
-        follow_redirects=False,
-    )
-    assert form.status_code == 303
-    qs = parse_qs(urlparse(form.headers["location"]).query)
-    assert qs["context_error"] == ["too_long"]
-    assert qs["selected"] == [source_id]
+    # A rejected edit must not clear what was already saved.
     detail = client.get(f"/v1/sources/{source_id}", headers=auth_headers(None))
     assert detail.json()["context"] == "kept-short"
 
@@ -215,21 +201,23 @@ def test_undo_drops_context_and_fts(client) -> None:
         conn.close()
 
 
-def test_inbox_shows_context_not_in_digest(client) -> None:
+def test_inbox_row_shows_context_and_digest_does_not(client) -> None:
     source_id = _capture(client, "plain clipboard line")
-    assert _post_context(client, source_id, "UNIQUE_MEMO_XYZ <script>alert(2)</script>").status_code == 204
+    memo = "UNIQUE_MEMO_XYZ <script>alert(2)</script>"
+    assert _post_context(client, source_id, memo).status_code == 204
     client.cookies.set("melt_token", TOKEN)
-    page = client.get(f"/?selected={source_id}")
-    assert page.status_code == 200
-    assert "UNIQUE_MEMO_XYZ" in page.text
-    assert "context-body" in page.text
-    assert "<script>alert(2)</script>" not in page.text
-    assert "Useful for" in page.text
-    digest_at = page.text.index('class="pane digest"')
-    assert "UNIQUE_MEMO_XYZ" not in page.text[digest_at:]
-    assert "autofocus" not in page.text
-    home = client.get("/")
-    assert "autofocus" in home.text
+
+    rows = client.get("/v1/inbox").json()["rows"]
+    row = next(item for item in rows if item["source_id"] == source_id)
+    # The list carries the user's own words verbatim; it is JSON, so the
+    # script tag is data rather than markup.
+    assert row["context"] == memo
+    # The title is still the source preview, never the useful-for line.
+    assert row["title"] == "plain clipboard line"
+
+    detail = client.get(f"/v1/sources/{source_id}").json()
+    assert detail["context"] == memo
+    assert "UNIQUE_MEMO_XYZ" not in detail["digest"]["summary"]
 
 
 def test_context_not_in_digest_json(client) -> None:
@@ -280,33 +268,27 @@ def test_migrate_bad_phrases_leaves_old_fts(tmp_path: Path) -> None:
         conn.close()
 
 
-def test_form_keeps_q_unless_cleared(client) -> None:
-    source_id = _capture(client, "unrelated clipboard text xyz")
-    assert _post_context(client, source_id, "sqlite wal for billing").status_code == 204
-    client.cookies.set("melt_token", TOKEN)
-    keep = client.post(
-        f"/v1/sources/{source_id}/context-form",
-        data={"body": "sqlite wal for billing", "q": "sqlite wal for billing"},
-        follow_redirects=False,
-    )
-    assert keep.status_code == 303
-    qs = parse_qs(urlparse(keep.headers["location"]).query)
-    assert qs["selected"] == [source_id]
-    assert qs["q"] == ["sqlite wal for billing"]
-    assert "context_error" not in qs
+def test_search_follows_the_context_line(client) -> None:
+    """Saving, then clearing, a useful-for line moves the row in and out of
+    the result set.
 
-    clear = client.post(
-        f"/v1/sources/{source_id}/context-form",
-        data={"body": "", "q": "sqlite wal for billing"},
-        follow_redirects=False,
-    )
-    assert clear.status_code == 303
-    qs2 = parse_qs(urlparse(clear.headers["location"]).query)
-    assert qs2["selected"] == [source_id]
-    assert "q" not in qs2
-    page = client.get(clear.headers["location"])
-    assert page.status_code == 200
-    assert "unrelated clipboard text xyz" in page.text
+    The retired form route used to encode this by keeping `q` in a redirect
+    only while the source still matched. The client keeps its own query now,
+    so what matters is that /v1/inbox agrees with the stored line.
+    """
+    source_id = _capture(client, "unrelated clipboard text xyz")
+    client.cookies.set("melt_token", TOKEN)
+
+    assert _post_context(client, source_id, "sqlite wal for billing").status_code == 204
+    hits = client.get("/v1/inbox", params={"q": "sqlite wal for billing"}).json()["rows"]
+    assert [row["source_id"] for row in hits] == [source_id]
+
+    assert _post_context(client, source_id, "").status_code == 204
+    gone = client.get("/v1/inbox", params={"q": "sqlite wal for billing"}).json()["rows"]
+    assert gone == []
+    # The source itself is still listed; only the extra words went away.
+    listed = client.get("/v1/inbox").json()["rows"]
+    assert [row["title"] for row in listed] == ["unrelated clipboard text xyz"]
 
 
 def test_context_secret_blocked_and_allow(client, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -314,16 +296,6 @@ def test_context_secret_blocked_and_allow(client, monkeypatch: pytest.MonkeyPatc
     blocked = _post_context(client, source_id, SECRET_LINE)
     assert blocked.status_code == 400
     assert blocked.json()["code"] == "secret_blocked"
-    client.cookies.set("melt_token", TOKEN)
-    form = client.post(
-        f"/v1/sources/{source_id}/context-form",
-        data={"body": SECRET_LINE, "q": ""},
-        follow_redirects=False,
-    )
-    assert form.status_code == 303
-    assert parse_qs(urlparse(form.headers["location"]).query)["context_error"] == [
-        "secret_blocked"
-    ]
     monkeypatch.setenv("MELT_ALLOW_SECRETS", "1")
     allowed = _post_context(client, source_id, SECRET_LINE)
     assert allowed.status_code == 204

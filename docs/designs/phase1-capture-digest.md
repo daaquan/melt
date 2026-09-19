@@ -164,6 +164,8 @@ Phase 1 success is **lexical** FTS, not semantic search.
 
 Locked wireframe: [inbox-wireframe.html](./inbox-wireframe.html)
 
+> Superseded for the inbox by [dioxus-inbox.md](./dioxus-inbox.md): the server-rendered inbox this section describes is now a Dioxus client. Capture, storage, dedup, and provenance below are unchanged.
+
 - Search first. List with `captured N times`. Two columns: **Source · immutable** | **Digest · derived · not truth**.
 - Actions: Copy source, Mark as used.
 - Empty: “Copy anything. Press the hotkey. Nothing to file.”

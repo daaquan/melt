@@ -72,6 +72,8 @@ _LIST_SELECT = """
         SELECT s.id AS source_id, s.kind, s.normalized_body,
                c.raw_body, c.captured_at, c.id AS capture_id,
                (SELECT COUNT(*) FROM captures cx WHERE cx.source_id = s.id) AS occ,
+               (SELECT COUNT(*) FROM reuse_events rx
+                 WHERE rx.source_id = s.id AND rx.kind = 'mark_used') AS used_count,
                d.summary, d.model, d.retrieval_phrases_json, d.useful_for_json,
                ctx.body AS context_body
         FROM {from_clause}

@@ -1,0 +1,5 @@
+# Built by scripts/build-ui.sh and committed so installing melt needs no Rust.
+# Marked binary so diffs and merges do not try to read it as text.
+src/melt/static/ui/melt_bg.wasm binary
+src/melt/static/ui/melt.js linguist-generated=true
+src/melt/static/ui/snippets/** linguist-generated=true

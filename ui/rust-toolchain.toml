@@ -1,0 +1,5 @@
+# Pinned so the committed bundle in src/melt/static/ui is reproducible: CI
+# rebuilds it and diffs, and a different rustc would change the bytes.
+[toolchain]
+channel = "1.94.1"
+targets = ["wasm32-unknown-unknown"]
