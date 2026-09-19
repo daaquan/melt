@@ -19,6 +19,20 @@ jobs:
       - run: pip install -e ".[dev]"
       - run: pytest
 
+  ui:
+    # The WASM bundle under src/melt/static/ui is committed so installing melt
+    # needs no Rust. That only holds if it matches ui/, so rebuild and diff.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ui
+      - run: ./scripts/build-ui.sh --check
+
   windows-helper:
     runs-on: windows-latest
     steps:

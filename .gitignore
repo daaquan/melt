@@ -11,3 +11,8 @@ melt.db
 melt.db-*
 .coverage
 htmlcov/
+
+# Rust UI build state. The bundle it produces, src/melt/static/ui/, IS committed
+# so the wheel and the image need no toolchain.
+ui/target/
+ui/.tools/

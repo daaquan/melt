@@ -11,21 +11,22 @@ CATALOG = json.loads(
 )
 
 
-class AttrCollector(HTMLParser):
-    """Collects one attribute off every tag so we can assert on parsed HTML."""
+class InlineCodeFinder(HTMLParser):
+    """Records <style> blocks and <script> tags that carry no src.
 
-    def __init__(self, tag: str, attr: str) -> None:
+    The CSP has no 'unsafe-inline', so either one would be dropped by the
+    browser and the shell would never boot.
+    """
+
+    def __init__(self) -> None:
         super().__init__()
-        self.tag = tag
-        self.attr = attr
-        self.values: list[str] = []
+        self.inline: list[str] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if tag != self.tag:
-            return
-        for name, value in attrs:
-            if name == self.attr and value is not None:
-                self.values.append(value)
+        if tag == "style":
+            self.inline.append("style")
+        if tag == "script" and not any(name == "src" for name, _ in attrs):
+            self.inline.append("script")
 
 
 def test_search_includes_source_and_times(client) -> None:
@@ -54,7 +55,14 @@ def test_fts_metachar_200(client) -> None:
         assert r.status_code == 200
 
 
-def test_xss_escaped(client) -> None:
+def test_shell_never_carries_capture_text(client) -> None:
+    """The one page the server renders is a fixed file.
+
+    Capture bodies now reach the browser as JSON and are put in the DOM as text
+    nodes by the client, so there is no template left to escape them wrong: the
+    shell is byte-identical whether or not a capture holds a script tag.
+    """
+    empty = client.get("/")
     client.post(
         "/v1/captures",
         json={"kind": "text", "body": "<script>alert(1)</script>"},
@@ -63,15 +71,20 @@ def test_xss_escaped(client) -> None:
     client.cookies.set("melt_token", TOKEN)
     page = client.get("/")
     assert page.status_code == 200
-    assert "<script>alert(1)</script>" not in page.text
-    assert "alert(1)" in page.text
+    assert page.text == empty.text
+    assert "alert(1)" not in page.text
+
+    # The payload survives intact on the JSON surface, where it is data.
+    rows = client.get("/v1/inbox", headers=auth_headers(None)).json()["rows"]
+    assert any(row["title"] == "<script>alert(1)</script>" for row in rows)
 
 
 def test_login_wrong_token(client) -> None:
     r = client.post("/v1/login", data={"token": "nope"})
     assert r.status_code == 401
     assert "melt_token" not in r.headers.get("set-cookie", "")
-    assert CATALOG["login.error"] in r.text
+    # The client reads `code` and picks the catalog string itself.
+    assert r.json()["code"] == "auth"
 
 
 def test_login_cookie_is_not_secure_on_http(client) -> None:
@@ -126,18 +139,21 @@ def test_bearer_non_ascii_token_is_401_not_500(client) -> None:
 def test_inbox_recency_and_mark_used(client) -> None:
     client.post("/v1/captures", json={"kind": "text", "body": "usable item"}, headers=auth_headers("u1"))
     client.cookies.set("melt_token", TOKEN)
-    page = client.get("/")
+    page = client.get("/v1/inbox")
     assert page.status_code == 200
-    assert "usable item" in page.text
-    source_id = client.get("/v1/search", params={"q": "usable"}, headers=auth_headers(None)).json()["hits"][0][
-        "source_id"
-    ]
+    rows = page.json()["rows"]
+    assert rows[0]["title"] == "usable item"
+    assert rows[0]["used_count"] == 0
+    source_id = rows[0]["source_id"]
     used = client.post(
         f"/v1/sources/{source_id}/reuse",
         json={"kind": "mark_used"},
         headers=auth_headers(None),
     )
     assert used.status_code == 200
+    # The list carries the marker, so a used capture reads as used without
+    # opening it.
+    assert client.get("/v1/inbox").json()["rows"][0]["used_count"] == 1
 
 
 def test_undo_last_deletes_source(client) -> None:
@@ -175,19 +191,40 @@ def test_page_assets_survive_the_csp(client) -> None:
     client.post("/v1/captures", json={"kind": "text", "body": "styled"}, headers=auth_headers("css"))
     client.cookies.set("melt_token", TOKEN)
     page = client.get("/")
-    assert "default-src 'self'" in page.headers["content-security-policy"]
-    # `default-src 'self'` drops inline blocks, so the page must not rely on them.
-    assert "<style>" not in page.text
-    assert "<script>" not in page.text
-    for asset in ("/static/app.css", "/static/inbox.js"):
-        assert client.get(asset).status_code == 200
+    csp = page.headers["content-security-policy"]
+    assert "default-src 'self'" in csp
+    # Compiling the client's module needs this and nothing wider; plain eval()
+    # stays blocked.
+    assert "script-src 'self' 'wasm-unsafe-eval'" in csp
+    assert "unsafe-inline" not in csp
 
-
-def test_delete_form_carries_a_parseable_confirm(client) -> None:
-    client.post("/v1/captures", json={"kind": "text", "body": "deletable"}, headers=auth_headers("d1"))
-    client.cookies.set("melt_token", TOKEN)
-    page = client.get("/")
-    parser = AttrCollector("form", "data-confirm")
+    parser = InlineCodeFinder()
     parser.feed(page.text)
-    # A quote-bearing string interpolated into an attribute truncates it.
-    assert parser.values == [CATALOG["action.delete_confirm"]]
+    assert parser.inline == []
+
+    for asset in (
+        "/static/app.css",
+        "/static/icon.svg",
+        "/static/ui/boot.js",
+        "/static/ui/theme-boot.js",
+        "/static/ui/melt.js",
+        "/static/ui/melt_bg.wasm",
+    ):
+        assert client.get(asset).status_code == 200, asset
+
+    # instantiateStreaming refuses anything but application/wasm, and
+    # nosniff means the browser will not guess.
+    wasm = client.get("/static/ui/melt_bg.wasm")
+    assert wasm.headers["content-type"] == "application/wasm"
+
+
+def test_catalog_reaches_the_client_intact(client) -> None:
+    """Locale strings ride JSON now, not HTML attributes.
+
+    The delete confirmation is the string that used to break: it carries
+    quotes, and interpolating it into an attribute truncated it. Over
+    /v1/i18n it arrives byte for byte.
+    """
+    catalog = client.get("/v1/i18n").json()["catalog"]
+    assert catalog["action.delete_confirm"] == CATALOG["action.delete_confirm"]
+    assert catalog == CATALOG

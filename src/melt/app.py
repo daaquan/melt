@@ -7,12 +7,10 @@ import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated
-from urllib.parse import urlencode
 
 from fastapi import Depends, FastAPI, Form, Header, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 from starlette.middleware.base import BaseHTTPMiddleware
 
@@ -29,11 +27,10 @@ from melt.db import (
     recency_list,
     search_sources,
     source_detail,
-    source_matches_query,
     undo_latest,
     upsert_context,
 )
-from melt.i18n import t, load_catalog
+from melt.i18n import load_catalog
 from melt.normalize import NormalizeError, infer_kind, normalize, normalize_context
 from melt.secrets import looks_like_secret
 
@@ -41,14 +38,19 @@ log = logging.getLogger("melt")
 logging.basicConfig(level=logging.INFO)
 
 ROOT = Path(__file__).resolve().parent
-TEMPLATES = Jinja2Templates(directory=str(ROOT / "templates"))
-TEMPLATES.env.autoescape = True
+STATIC = ROOT / "static"
+SHELL = STATIC / "index.html"
 
-# `default-src 'self'` rejects inline <style>/<script>, so the inbox loads both
-# from /static. Keep it that way when editing the templates.
-CSP = "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+# `default-src 'self'` rejects inline <style>/<script>, so the shell loads both
+# from /static. `wasm-unsafe-eval` is the narrow grant that lets the browser
+# compile the Dioxus module; it does not re-enable eval() for JavaScript.
+CSP = (
+    "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; "
+    "base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+)
 
 DISPLAY_CHARS = 20_000
+TITLE_CHARS = 80
 LOGIN_MAX = 4096
 SIZE_OVERHEAD = 4096
 
@@ -143,7 +145,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="melt", docs_url=None, redoc_url=None, lifespan=lifespan)
 app.add_middleware(SizeLimitMiddleware)
-app.mount("/static", StaticFiles(directory=str(ROOT / "static")), name="static")
+app.mount("/static", StaticFiles(directory=str(STATIC)), name="static")
 
 
 @app.exception_handler(HTTPException)
@@ -272,19 +274,30 @@ def api_search(
 def api_source(
     source_id: str,
     request: Request,
+    preview: bool = Query(default=False),
     conn: sqlite3.Connection = Depends(get_conn),
     authorization: Annotated[str | None, Header()] = None,
 ) -> dict:
+    """The full capture. `preview=1` caps `raw_body` at the display budget.
+
+    The inbox opens a capture on every arrow key, and a body may be 1 MiB, so
+    the client asks for a preview to render and for the whole thing only when
+    it is about to put it on the clipboard.
+    """
     require_auth(request, authorization)
     detail = source_detail(conn, source_id)
     if detail is None:
         raise HTTPException(status_code=404, detail=_problem("not_found", "source missing", 404))
     digest = detail["digest"]
     latest = detail["captures"][0] if detail["captures"] else None
+    raw = latest["raw_body"] if latest else ""
+    truncated = preview and len(raw) > DISPLAY_CHARS
     return {
         "source_id": source_id,
         "kind": detail["source"]["kind"],
-        "raw_body": latest["raw_body"] if latest else "",
+        "raw_body": raw[:DISPLAY_CHARS] if truncated else raw,
+        "raw_chars": len(raw),
+        "truncated": truncated,
         "normalized_body": detail["source"]["normalized_body"],
         "digest": None
         if digest is None
@@ -295,6 +308,9 @@ def api_source(
         },
         "captured_at": [row["captured_at"] for row in detail["captures"]],
         "context": detail["context"],
+        "occurrence_count": len(detail["captures"]),
+        "used_count": detail["used_count"],
+        "latest_capture_id": latest["id"] if latest else None,
     }
 
 
@@ -331,26 +347,6 @@ def api_context(
         raise HTTPException(status_code=400, detail=_problem(err, err, 400))
     upsert_context(conn, source_id, body or "")
     return Response(status_code=204)
-
-
-@app.post("/v1/sources/{source_id}/context-form")
-def context_form(
-    source_id: str,
-    request: Request,
-    body: Annotated[str, Form()] = "",
-    q: Annotated[str, Form()] = "",
-    conn: sqlite3.Connection = Depends(get_conn),
-    authorization: Annotated[str | None, Header()] = None,
-) -> Response:
-    if not is_authed(request, authorization):
-        return RedirectResponse("/", status_code=302)
-    if source_detail(conn, source_id) is None:
-        return RedirectResponse("/", status_code=303)
-    prepared, err = _prepare_context(body)
-    if err:
-        return _inbox_redirect(source_id, q, conn, error=err)
-    upsert_context(conn, source_id, prepared or "")
-    return _inbox_redirect(source_id, q, conn)
 
 
 class ReuseIn(BaseModel):
@@ -399,72 +395,86 @@ def api_delete(
     return {"ok": True, "result": result}
 
 
-def _inbox_redirect(
-    source_id: str,
-    q: str,
-    conn: sqlite3.Connection,
-    *,
-    error: str | None = None,
-) -> RedirectResponse:
-    """303 back to the inbox. Keep `q` only if this source still MATCHES it."""
-    params: dict[str, str] = {"selected": source_id}
-    if error:
-        params["context_error"] = error
-    if q and source_matches_query(conn, source_id, q):
-        params["q"] = q
-    return RedirectResponse("/?" + urlencode(params), status_code=303)
+@app.get("/v1/i18n")
+def api_i18n(request: Request) -> dict:
+    """UI strings for the client.
+
+    Unauthenticated on purpose: the token gate has to render before there is a
+    session, and the catalog is the same file shipped in the repo.
+    """
+    return {"catalog": getattr(request.app.state, "catalog", {})}
 
 
-@app.get("/", response_class=HTMLResponse)
-def inbox(
+@app.get("/v1/session")
+def api_session(
+    request: Request,
+    authorization: Annotated[str | None, Header()] = None,
+) -> dict:
+    """Whether the cookie still matches MELT_TOKEN.
+
+    Lets the client tell "log in" apart from "the API is down" without burning
+    a real query, and answers the same shape either way so a missing session is
+    not an error.
+    """
+    return {"authenticated": is_authed(request, authorization)}
+
+
+@app.get("/v1/inbox")
+def api_inbox(
     request: Request,
     q: str = Query(default=""),
-    selected: str | None = None,
-    context_error: str | None = None,
     conn: sqlite3.Connection = Depends(get_conn),
     authorization: Annotated[str | None, Header()] = None,
-) -> HTMLResponse:
-    if not is_authed(request, authorization):
-        return TEMPLATES.TemplateResponse(
-            request,
-            "login.html",
-            {"error": None, "t": t, "catalog": getattr(request.app.state, "catalog", {})},
-        )
-    if context_error not in {"too_long", "secret_blocked"}:
-        context_error = None
-    rows = recency_list(conn) if not q else search_sources(conn, q)
-    catalog = request.app.state.catalog
-    current = None
-    if rows:
-        wanted = selected or rows[0]["source_id"]
-        current = source_detail(conn, wanted)
-        if current is None and rows:
-            current = source_detail(conn, rows[0]["source_id"])
-    return TEMPLATES.TemplateResponse(
-        request,
-        "inbox.html",
-        {
-            "q": q,
-            "selected": selected,
-            "context_error": context_error,
-            "rows": rows,
-            "current": current,
-            "t": t,
-            "catalog": catalog,
-            "display_chars": DISPLAY_CHARS,
-        },
+) -> dict:
+    """Recency list, or search hits when `q` is set.
+
+    `/v1/search` returns ids for scripts; this returns the columns the list
+    actually paints, so opening the inbox is one request instead of N.
+    """
+    require_auth(request, authorization)
+    rows = search_sources(conn, q) if q else recency_list(conn)
+    return {
+        "q": q,
+        "rows": [
+            {
+                "source_id": row["source_id"],
+                "kind": row["kind"],
+                "title": row["normalized_body"].split("\n")[0][:TITLE_CHARS],
+                "captured_at": row["captured_at"],
+                "occurrence_count": row["occ"],
+                "used_count": row["used_count"],
+                "context": row["context_body"],
+            }
+            for row in rows
+        ],
+    }
+
+
+@app.get("/")
+def shell() -> FileResponse:
+    """The static client shell.
+
+    It holds no capture data, so it is served without auth; the client asks
+    /v1/session and shows the token gate itself. `no-store` keeps a stale shell
+    from pointing at a bundle that a rebuild has replaced.
+    """
+    return FileResponse(
+        SHELL,
+        media_type="text/html; charset=utf-8",
+        headers={"Cache-Control": "no-store"},
     )
 
 
 @app.post("/v1/login")
 def login(request: Request, token: Annotated[str, Form()] = "") -> Response:
+    """Form post, answered with a cookie.
+
+    The client fetches this rather than reimplementing it: the token goes
+    straight into an HttpOnly cookie and never lands in JS state, and a no-JS
+    client can still post the same form.
+    """
     if not token_matches(token, config.token()):
-        return TEMPLATES.TemplateResponse(
-            request,
-            "login.html",
-            {"error": "auth", "t": t, "catalog": getattr(request.app.state, "catalog", {})},
-            status_code=401,
-        )
+        return JSONResponse(status_code=401, content=_problem("auth", "token mismatch", 401))
     resp = RedirectResponse("/", status_code=302)
     resp.set_cookie(
         config.COOKIE_NAME,
@@ -477,29 +487,8 @@ def login(request: Request, token: Annotated[str, Form()] = "") -> Response:
     return resp
 
 
-@app.post("/v1/sources/{source_id}/reuse-form")
-def reuse_form(
-    source_id: str,
-    request: Request,
-    kind: Annotated[str, Form()] = "mark_used",
-    conn: sqlite3.Connection = Depends(get_conn),
-    authorization: Annotated[str | None, Header()] = None,
-) -> Response:
-    if not is_authed(request, authorization):
-        return RedirectResponse("/", status_code=302)
-    if kind in {"copy_source", "mark_used"} and source_detail(conn, source_id):
-        mark_reuse(conn, source_id, kind)
-    return RedirectResponse(f"/?selected={source_id}", status_code=302)
-
-
-@app.post("/v1/captures/{capture_id}/delete-form")
-def delete_form(
-    capture_id: str,
-    request: Request,
-    conn: sqlite3.Connection = Depends(get_conn),
-    authorization: Annotated[str | None, Header()] = None,
-) -> Response:
-    if not is_authed(request, authorization):
-        return RedirectResponse("/", status_code=302)
-    delete_capture(conn, capture_id)
-    return RedirectResponse("/", status_code=302)
+@app.post("/v1/logout")
+def logout() -> Response:
+    resp = Response(status_code=204)
+    resp.delete_cookie(config.COOKIE_NAME, path="/")
+    return resp

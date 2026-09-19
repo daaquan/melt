@@ -70,6 +70,30 @@ No such source or capture.
 
 `kind` must be `copy_source` or `mark_used`.
 
+## unknown
+
+The inbox got a failure whose `code` is not in `locales/en.json`. The status is
+still in the response; read it from the browser devtools network tab and look
+the code up above. Adding the missing `error.<code>.*` keys fixes the message.
+
+## The inbox is blank
+
+The page is a shell; the UI itself is a WebAssembly module. Open devtools and
+check, in order:
+
+- **A `Content-Security-Policy` violation on `wasm-unsafe-eval`.** A reverse
+  proxy that rewrites CSP headers will strip it and the module never compiles.
+  melt sends `script-src 'self' 'wasm-unsafe-eval'`; let it through unchanged.
+- **`/static/ui/melt_bg.wasm` served as anything but `application/wasm`.**
+  `X-Content-Type-Options: nosniff` means the browser will not guess, and
+  `instantiateStreaming` refuses the response. Some proxies mangle this.
+- **404 on `/static/ui/melt.js`.** The bundle is missing from the install. It is
+  committed, so this means a partial checkout or a wheel built before the UI
+  existed. Run `scripts/build-ui.sh`.
+
+Captures are unaffected either way: `POST /v1/captures` and the rest of `/v1`
+are plain JSON and do not need the client.
+
 ## Helper files
 
 | File | Meaning |
