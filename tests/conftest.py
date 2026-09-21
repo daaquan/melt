@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
@@ -7,6 +8,12 @@ import pytest
 from fastapi.testclient import TestClient
 
 TOKEN = "test-token-abcdef"
+
+# The catalog the client renders every string from; several modules assert
+# against it, so it is loaded once here.
+CATALOG = json.loads(
+    (Path(__file__).resolve().parents[1] / "locales" / "en.json").read_text(encoding="utf-8")
+)
 
 
 @pytest.fixture()

@@ -29,14 +29,3 @@ def load_catalog() -> dict:
     if not path.is_file():
         return {}
     return json.loads(path.read_text(encoding="utf-8"))
-
-
-def t(key: str, catalog: dict | None = None, **kwargs: str) -> str:
-    data = catalog if catalog is not None else load_catalog()
-    value = data.get(key, key)
-    if kwargs:
-        try:
-            return value.format(**kwargs)
-        except (KeyError, IndexError):
-            return value
-    return value

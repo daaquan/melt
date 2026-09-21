@@ -178,9 +178,14 @@ async def problem_response(request: Request, exc: HTTPException) -> JSONResponse
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
     hostname = request.headers.get("host", "").split(":")[0]
+    # The rebinding guard answers here, but its 400 is still a response and
+    # gets dressed like every other one on the way out.
     if hostname not in config.allowed_hosts():
-        return JSONResponse(status_code=400, content=_problem("bad_host", "host not allowed", 400))
-    response: Response = await call_next(request)
+        response: Response = JSONResponse(
+            status_code=400, content=_problem("bad_host", "host not allowed", 400)
+        )
+    else:
+        response = await call_next(request)
     response.headers["Content-Security-Policy"] = CSP
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["Referrer-Policy"] = "no-referrer"
@@ -295,13 +300,16 @@ def api_source(
     latest = detail["captures"][0] if detail["captures"] else None
     raw = detail["latest_body"]
     truncated = preview and len(raw) > DISPLAY_CHARS
+    # The normalized body rides along at the same size, so cap it too; leaving
+    # it whole put the megabyte back that `preview` exists to keep off the wire.
+    normalized = detail["source"]["normalized_body"]
     return {
         "source_id": source_id,
         "kind": detail["source"]["kind"],
         "raw_body": raw[:DISPLAY_CHARS] if truncated else raw,
         "raw_chars": len(raw),
         "truncated": truncated,
-        "normalized_body": detail["source"]["normalized_body"],
+        "normalized_body": normalized[:DISPLAY_CHARS] if preview else normalized,
         "digest": None
         if digest is None
         else {

@@ -59,6 +59,14 @@ CREATE VIRTUAL TABLE IF NOT EXISTS sources_fts USING fts5(
   digest_text,
   user_text
 );
+
+-- The inbox asks for the newest capture, the occurrence count, the used count
+-- and the newest digest once per row, and it asks on every keystroke. Without
+-- these each of those is a table scan. Idempotent, so an existing file picks
+-- them up the next time init_db runs.
+CREATE INDEX IF NOT EXISTS captures_by_source ON captures(source_id, captured_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS reuse_events_by_source ON reuse_events(source_id, kind);
+CREATE INDEX IF NOT EXISTS digests_by_source ON digests(source_id, created_at DESC, id DESC);
 """
 
 
@@ -68,22 +76,24 @@ PRAGMAS = (
     "PRAGMA foreign_keys=ON",
 )
 
+# A list row is a title, a time and three counts. It carried the capture body
+# and four digest columns as well, so painting 100 rows moved up to 100 MiB
+# that nothing rendered. `normalized_body` only ever becomes a one-line title,
+# so the read is capped well above any title length rather than unbounded.
+LIST_TITLE_CHARS = 200
+
 _LIST_SELECT = """
-        SELECT s.id AS source_id, s.kind, s.normalized_body,
-               c.raw_body, c.captured_at, c.id AS capture_id,
+        SELECT s.id AS source_id, s.kind,
+               substr(s.normalized_body, 1, {title_chars}) AS normalized_body,
+               c.captured_at,
                (SELECT COUNT(*) FROM captures cx WHERE cx.source_id = s.id) AS occ,
                (SELECT COUNT(*) FROM reuse_events rx
                  WHERE rx.source_id = s.id AND rx.kind = 'mark_used') AS used_count,
-               d.summary, d.model, d.retrieval_phrases_json, d.useful_for_json,
                ctx.body AS context_body
         FROM {from_clause}
         JOIN captures c ON c.id = (
           SELECT id FROM captures WHERE source_id = s.id
           ORDER BY captured_at DESC, id DESC LIMIT 1
-        )
-        LEFT JOIN digests d ON d.id = (
-          SELECT id FROM digests WHERE source_id = s.id
-          ORDER BY created_at DESC, id DESC LIMIT 1
         )
         LEFT JOIN contexts ctx ON ctx.source_id = s.id
 """
@@ -91,7 +101,6 @@ _LIST_SELECT = """
 
 def connect(path: Path) -> sqlite3.Connection:
     """Open a connection. Assumes init_db has already created the schema."""
-    path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(
         path, check_same_thread=False, isolation_level=None, timeout=30
     )
@@ -103,6 +112,7 @@ def connect(path: Path) -> sqlite3.Connection:
 
 def init_db(path: Path) -> None:
     """Create the schema and migrate FTS. Call this once at startup."""
+    path.parent.mkdir(parents=True, exist_ok=True)
     conn = connect(path)
     try:
         conn.executescript(SCHEMA)
@@ -383,7 +393,7 @@ def ingest(
 
 
 def recency_list(conn: sqlite3.Connection, limit: int = 100) -> list[sqlite3.Row]:
-    sql = _LIST_SELECT.format(from_clause="sources s") + """
+    sql = _LIST_SELECT.format(from_clause="sources s", title_chars=LIST_TITLE_CHARS) + """
         ORDER BY c.captured_at DESC, c.id DESC
         LIMIT ?
         """
@@ -394,26 +404,15 @@ def search_sources(conn: sqlite3.Connection, q: str) -> list[sqlite3.Row]:
     match = fts_query(q)
     if match is None:
         return []
-    sql = _LIST_SELECT.format(from_clause="sources_fts JOIN sources s ON s.id = sources_fts.source_id")
+    sql = _LIST_SELECT.format(
+        from_clause="sources_fts JOIN sources s ON s.id = sources_fts.source_id",
+        title_chars=LIST_TITLE_CHARS,
+    )
     sql += """
         WHERE sources_fts MATCH ?
         ORDER BY rank
         """
     return conn.execute(sql, (match,)).fetchall()
-
-
-def source_matches_query(conn: sqlite3.Connection, source_id: str, q: str) -> bool:
-    match = fts_query(q)
-    if match is None:
-        return False
-    row = conn.execute(
-        """
-        SELECT 1 FROM sources_fts
-        WHERE sources_fts MATCH ? AND source_id = ?
-        """,
-        (match, source_id),
-    ).fetchone()
-    return row is not None
 
 
 def source_exists(conn: sqlite3.Connection, source_id: str) -> bool:

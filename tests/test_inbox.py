@@ -6,12 +6,7 @@ from pathlib import Path
 
 from melt.app import LOGIN_MAX
 
-from tests.conftest import TOKEN, auth_headers
-
-CATALOG = json.loads(
-    (Path(__file__).resolve().parents[1] / "locales" / "en.json").read_text(encoding="utf-8")
-)
-
+from tests.conftest import CATALOG, TOKEN, auth_headers
 
 class InlineCodeFinder(HTMLParser):
     """Records <style> blocks and <script> tags that carry no src.
@@ -189,6 +184,15 @@ def test_error_body_is_a_flat_problem(client) -> None:
     assert oversize.json()["code"] == "too_large"
 
 
+def test_a_rejected_host_still_gets_the_security_headers(client) -> None:
+    """The rebinding guard answers early, but its 400 is a response like any other."""
+    r = client.get("/healthz", headers={"Host": "evil.example"})
+    assert r.status_code == 400
+    assert r.json()["code"] == "bad_host"
+    assert "default-src 'self'" in r.headers["content-security-policy"]
+    assert r.headers["x-content-type-options"] == "nosniff"
+
+
 def test_a_form_post_is_capped_at_the_login_budget(client) -> None:
     """The small ceiling follows the form encoding, not one hardcoded path.
 
@@ -232,16 +236,7 @@ def test_page_assets_survive_the_csp(client) -> None:
     parser.feed(page.text)
     assert parser.inline == []
 
-    for asset in (
-        "/static/app.css",
-        "/static/icon.svg",
-        "/static/ui/boot.js",
-        "/static/ui/theme-boot.js",
-        "/static/ui/melt.js",
-        "/static/ui/melt_bg.wasm",
-    ):
-        assert client.get(asset).status_code == 200, asset
-
+    # Every asset is reachable: test_every_static_file_is_served walks the tree.
     # instantiateStreaming refuses anything but application/wasm, and
     # nosniff means the browser will not guess.
     wasm = client.get("/static/ui/melt_bg.wasm")

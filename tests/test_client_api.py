@@ -11,12 +11,7 @@ from pathlib import Path
 
 from melt.app import DISPLAY_CHARS
 
-from tests.conftest import TOKEN, auth_headers
-
-CATALOG = json.loads(
-    (Path(__file__).resolve().parents[1] / "locales" / "en.json").read_text(encoding="utf-8")
-)
-
+from tests.conftest import CATALOG, TOKEN, auth_headers
 
 def _capture(client, body: str, key: str) -> str:
     r = client.post("/v1/captures", json={"kind": "text", "body": body}, headers=auth_headers(key))
@@ -196,6 +191,37 @@ def test_source_detail_carries_what_the_actions_need(client) -> None:
     left = client.get(f"/v1/sources/{source_id}", headers=auth_headers(None)).json()
     assert left["occurrence_count"] == 1
     assert left["latest_capture_id"] != detail["latest_capture_id"]
+
+
+def test_preview_caps_the_normalized_body_too(client) -> None:
+    """`preview` exists to keep a megabyte off the wire, so both bodies obey it."""
+    body = "z" * (DISPLAY_CHARS + 500)
+    source_id = _capture(client, body, "n1")
+    preview = client.get(
+        f"/v1/sources/{source_id}", params={"preview": 1}, headers=auth_headers(None)
+    ).json()
+    assert len(preview["normalized_body"]) == DISPLAY_CHARS
+    full = client.get(f"/v1/sources/{source_id}", headers=auth_headers(None)).json()
+    assert full["normalized_body"] == body
+
+
+def test_the_inbox_hot_path_keeps_its_indexes(client) -> None:
+    """The list runs three correlated subqueries per row, on every keystroke.
+
+    Without these each one is a table scan, which is invisible until the
+    database has some history in it.
+    """
+    import sqlite3
+
+    from melt import config
+
+    _capture(client, "indexed", "x1")
+    conn = sqlite3.connect(config.db_path())
+    try:
+        names = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'index'")}
+    finally:
+        conn.close()
+    assert {"captures_by_source", "reuse_events_by_source", "digests_by_source"} <= names
 
 
 def test_missing_source_is_a_problem_object(client) -> None:
