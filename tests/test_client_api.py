@@ -230,24 +230,31 @@ def test_missing_source_is_a_problem_object(client) -> None:
     assert r.json()["code"] == "not_found"
 
 
-def test_every_error_code_the_client_shows_has_a_catalog_line(client) -> None:
+# Codes the client raises for itself; the server never sends them.
+CLIENT_SIDE_CODES = (
+    "api_unreachable",  # the fetch never landed (ui/src/api.rs)
+    "unknown",          # any code the catalog does not name
+)
+
+
+def test_every_error_code_has_a_catalog_line() -> None:
     """The client renders `error.<code>.body` straight from the catalog.
 
-    A code with no line would surface the key itself in the UI, so the two
-    have to stay in step.
+    A code with no line surfaces the key itself in the UI, so the set is read
+    back out of the source rather than kept by hand here: a new `_problem` or
+    `NormalizeError` fails this until someone writes its line.
     """
-    reachable = (
-        "auth",             # cookie stopped matching MELT_TOKEN
-        "not_found",        # the open capture was deleted elsewhere
-        "too_long",         # useful-for over 200 characters
-        "secret_blocked",   # useful-for looks like a token
-        "too_large",        # size middleware
-        "disk_full",        # sqlite could not write
-        "api_unreachable",  # the fetch never landed
-        "unknown",          # any code the catalog does not name
-    )
-    for code in reachable:
-        assert f"error.{code}.body" in CATALOG, code
+    import re
+
+    package = Path(__file__).resolve().parents[1] / "src" / "melt"
+    codes = set(CLIENT_SIDE_CODES)
+    for name in ("app.py", "normalize.py"):
+        text = (package / name).read_text(encoding="utf-8")
+        codes |= set(re.findall(r'_problem\(\s*"([a-z_]+)"', text))
+        codes |= set(re.findall(r'NormalizeError\(\s*"([a-z_]+)"', text))
+    assert len(codes) > 10, "the code scan found almost nothing; the patterns drifted"
+    missing = sorted(code for code in codes if f"error.{code}.body" not in CATALOG)
+    assert missing == [], missing
 
 
 def test_every_static_file_is_served(client) -> None:

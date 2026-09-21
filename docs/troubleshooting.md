@@ -70,6 +70,12 @@ No such source or capture.
 
 `kind` must be `copy_source` or `mark_used`.
 
+## error
+
+The request failed without a named code — a path that is not a melt route, or
+a framework error raised before a handler ran. The status says which. Check the
+URL first.
+
 ## unknown
 
 The inbox got a failure whose `code` is not in `locales/en.json`. The status is

@@ -70,5 +70,19 @@
   "error.disk_full.title": "Failed",
   "error.disk_full.body": "SQLite could not write. Check free disk space on the API host.",
   "error.unknown.title": "Failed",
-  "error.unknown.body": "The API refused that. See docs/troubleshooting.md."
+  "error.unknown.body": "The API refused that. See docs/troubleshooting.md.",
+  "error.empty.title": "Failed",
+  "error.empty.body": "Nothing left after trimming. Copy some text, then retry.",
+  "error.bad_url.title": "Failed",
+  "error.bad_url.body": "Not http/https, missing a host, or carrying userinfo.",
+  "error.bad_kind.title": "Failed",
+  "error.bad_kind.body": "kind must be url or text. Omit it and the server infers one.",
+  "error.conflict_idempotency.title": "Failed",
+  "error.conflict_idempotency.body": "Idempotency-Key reused with a different body. Use a new key.",
+  "error.bad_host.title": "Failed",
+  "error.bad_host.body": "Host is not in MELT_ALLOWED_HOSTS. Add the name you reach melt by.",
+  "error.bad_reuse.title": "Failed",
+  "error.bad_reuse.body": "kind must be copy_source or mark_used.",
+  "error.error.title": "Failed",
+  "error.error.body": "The API refused that without naming a code. See docs/troubleshooting.md."
 }
