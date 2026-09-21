@@ -35,19 +35,22 @@ enum Session {
 #[component]
 fn App() -> Element {
     let mut session = use_signal(|| Session::Loading);
-    let mut booted = use_signal(|| false);
 
+    // Two independent fetches, so they go out together rather than one after
+    // the other. The catalog is a GlobalSignal, so a late answer just repaints
+    // the strings; the screen does not wait on it to decide what to show.
     let boot = move || {
         spawn(async move {
             if let Ok(catalog) = api::catalog().await {
                 *i18n::CATALOG.write() = catalog;
             }
+        });
+        spawn(async move {
             session.set(match api::session().await {
                 Ok(true) => Session::Active,
                 Ok(false) => Session::Anonymous,
                 Err(_) => Session::Offline,
             });
-            booted.set(true);
         });
     };
 

@@ -416,17 +416,33 @@ def source_matches_query(conn: sqlite3.Connection, source_id: str, q: str) -> bo
     return row is not None
 
 
+def source_exists(conn: sqlite3.Connection, source_id: str) -> bool:
+    """Existence on its own, for the routes that only need to 404."""
+    return conn.execute("SELECT 1 FROM sources WHERE id = ?", (source_id,)).fetchone() is not None
+
+
 def source_detail(conn: sqlite3.Connection, source_id: str) -> dict | None:
     source = conn.execute("SELECT * FROM sources WHERE id = ?", (source_id,)).fetchone()
     if source is None:
         return None
+    # Ids and times for the whole history, but only the newest body: a source
+    # recaptured twenty times would otherwise read twenty 1 MiB bodies off disk
+    # on every arrow key, and nineteen of them are never rendered.
     captures = conn.execute(
         """
-        SELECT * FROM captures WHERE source_id = ?
+        SELECT id, captured_at FROM captures WHERE source_id = ?
         ORDER BY captured_at DESC, id DESC
         """,
         (source_id,),
     ).fetchall()
+    latest_body = conn.execute(
+        """
+        SELECT raw_body FROM captures WHERE source_id = ?
+        ORDER BY captured_at DESC, id DESC
+        LIMIT 1
+        """,
+        (source_id,),
+    ).fetchone()
     digest = latest_digest(conn, source_id)
     used = conn.execute(
         "SELECT COUNT(*) AS n FROM reuse_events WHERE source_id = ? AND kind = 'mark_used'",
@@ -438,6 +454,7 @@ def source_detail(conn: sqlite3.Connection, source_id: str) -> dict | None:
     return {
         "source": source,
         "captures": captures,
+        "latest_body": latest_body["raw_body"] if latest_body else "",
         "digest": digest,
         "used_count": int(used),
         "context": ctx["body"] if ctx else None,

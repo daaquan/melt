@@ -4,6 +4,8 @@ import json
 from html.parser import HTMLParser
 from pathlib import Path
 
+from melt.app import LOGIN_MAX
+
 from tests.conftest import TOKEN, auth_headers
 
 CATALOG = json.loads(
@@ -185,6 +187,34 @@ def test_error_body_is_a_flat_problem(client) -> None:
     assert oversize.status_code == 413
     # Middleware and routes must agree, so `code` is readable off the top level.
     assert oversize.json()["code"] == "too_large"
+
+
+def test_a_form_post_is_capped_at_the_login_budget(client) -> None:
+    """The small ceiling follows the form encoding, not one hardcoded path.
+
+    A token is a few dozen bytes; nothing that arrives form-encoded has any
+    business being a megabyte, and the error says which limit it hit.
+    """
+    r = client.post(
+        "/v1/login",
+        content=b"token=x",
+        headers={
+            "Content-Length": str(LOGIN_MAX + 1),
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+    )
+    assert r.status_code == 413
+    assert str(LOGIN_MAX) in r.json()["detail"]
+
+
+def test_a_json_capture_keeps_the_capture_budget(client) -> None:
+    """...and the same rule never squeezes a capture into the login ceiling."""
+    r = client.post(
+        "/v1/captures",
+        json={"kind": "text", "body": "y" * (LOGIN_MAX * 2)},
+        headers=auth_headers("wide"),
+    )
+    assert r.status_code == 201
 
 
 def test_page_assets_survive_the_csp(client) -> None:

@@ -72,7 +72,10 @@ into noise. Verified byte-identical across different checkout paths.
   pins that by asserting the page is byte-identical with and without a capture
   holding a script tag.
 - The token still never touches client state: the login form posts to the same
-  `/v1/login`, and the session lives in the same HttpOnly cookie.
+  `/v1/login`, and the session lives in the same HttpOnly cookie. That route
+  answers by `Accept`: 204 to the client's fetch, which would otherwise follow
+  the redirect and pull the whole shell down again, and the 302 to `/` to a
+  plain form post, which has nowhere else to go.
 - `GET /v1/session` and `GET /v1/i18n` answer without auth. Neither returns
   capture data; the sign-in screen needs both before a session exists.
 

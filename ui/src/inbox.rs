@@ -76,7 +76,11 @@ pub fn InboxView(on_signout: EventHandler<()>) -> Element {
         let q = (state.query)();
         let _ = (state.revision)();
         async move {
-            TimeoutFuture::new(DEBOUNCE_MS).await;
+            // Only typing needs the wait. An empty query is the list's resting
+            // state — first paint, and clearing the box — so it goes straight out.
+            if !q.is_empty() {
+                TimeoutFuture::new(DEBOUNCE_MS).await;
+            }
             api::inbox(&q).await
         }
     });

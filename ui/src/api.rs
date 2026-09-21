@@ -100,7 +100,6 @@ pub struct Detail {
     pub raw_chars: i64,
     pub truncated: bool,
     pub digest: Option<Digest>,
-    pub captured_at: Vec<f64>,
     pub context: Option<String>,
     pub occurrence_count: i64,
     pub used_count: i64,
@@ -170,13 +169,15 @@ pub async fn delete_capture(capture_id: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
-/// Posts the same form body the no-JS page used to. The 302 it answers with
-/// carries the Set-Cookie, and fetch follows it, so the session lands in the
-/// cookie jar without the UI ever holding the token.
+/// Posts the same form body the no-JS page used to, so the token goes straight
+/// into the HttpOnly cookie and never lands in JS state. `Accept` is what tells
+/// the server this is a fetch: it answers 204 with the cookie instead of the
+/// redirect a browser form needs, which fetch would follow into the whole shell.
 pub async fn login(token: &str) -> Result<(), ApiError> {
     let body = format!("token={}", encode(token));
     let request = Request::post("/v1/login")
         .header("Content-Type", "application/x-www-form-urlencoded")
+        .header("Accept", "application/json")
         .body(body);
     send(request).await?;
     Ok(())

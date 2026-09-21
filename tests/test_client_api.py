@@ -51,6 +51,30 @@ def test_session_probe_tracks_the_cookie(client) -> None:
     assert client.get("/v1/session", headers=auth_headers(None)).json()["authenticated"] is True
 
 
+def test_login_answers_a_fetch_client_without_the_shell(client) -> None:
+    """fetch() follows redirects, so a 302 here downloads index.html for nothing.
+
+    The WASM client asks for JSON and gets the cookie with no body; the no-JS
+    form post, which has nowhere to go but a page, still gets the redirect.
+    """
+    r = client.post(
+        "/v1/login",
+        data={"token": TOKEN},
+        headers={"Accept": "application/json"},
+        follow_redirects=False,
+    )
+    assert r.status_code == 204
+    assert "melt_token" in r.headers.get("set-cookie", "")
+    assert client.get("/v1/session").json()["authenticated"] is True
+
+
+def test_login_still_redirects_a_form_post(client) -> None:
+    r = client.post("/v1/login", data={"token": TOKEN}, follow_redirects=False)
+    assert r.status_code == 302
+    assert r.headers["location"] == "/"
+    assert client.get("/v1/session").json()["authenticated"] is True
+
+
 def test_logout_clears_the_cookie(client) -> None:
     client.post("/v1/login", data={"token": TOKEN}, follow_redirects=False)
     assert client.get("/v1/session").json()["authenticated"] is True

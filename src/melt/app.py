@@ -27,6 +27,7 @@ from melt.db import (
     recency_list,
     search_sources,
     source_detail,
+    source_exists,
     undo_latest,
     upsert_context,
 )
@@ -55,13 +56,26 @@ LOGIN_MAX = 4096
 SIZE_OVERHEAD = 4096
 
 
+FORM_TYPE = "application/x-www-form-urlencoded"
+
+
 class SizeLimitMiddleware(BaseHTTPMiddleware):
+    """Two body budgets, chosen by encoding rather than by route.
+
+    A capture arrives as JSON and may be a megabyte; a form post carries a
+    token and never should. Keying on the content type means a route added
+    later inherits the right ceiling instead of needing its path listed here.
+    `limit` allows for JSON framing, `stated` is the number worth telling the
+    caller about.
+    """
+
     async def dispatch(self, request: Request, call_next):
-        length = request.headers.get("content-length")
-        if request.url.path == "/v1/login":
-            limit = LOGIN_MAX
+        if request.headers.get("content-type", "").split(";")[0].strip() == FORM_TYPE:
+            limit = stated = LOGIN_MAX
         else:
-            limit = config.max_bytes() + SIZE_OVERHEAD
+            stated = config.max_bytes()
+            limit = stated + SIZE_OVERHEAD
+        length = request.headers.get("content-length")
         if length is not None:
             try:
                 n = int(length)
@@ -70,9 +84,7 @@ class SizeLimitMiddleware(BaseHTTPMiddleware):
             if n > limit:
                 return JSONResponse(
                     status_code=413,
-                    content=_problem(
-                        "too_large", f"body exceeds {config.max_bytes()} bytes", 413
-                    ),
+                    content=_problem("too_large", f"body exceeds {stated} bytes", 413),
                 )
         return await call_next(request)
 
@@ -187,15 +199,12 @@ class CaptureIn(BaseModel):
     body: str = Field(default="")
 
 
-@app.post("/v1/captures")
+@app.post("/v1/captures", dependencies=[Depends(require_auth)])
 def post_capture(
     payload: CaptureIn,
-    request: Request,
     conn: sqlite3.Connection = Depends(get_conn),
-    authorization: Annotated[str | None, Header()] = None,
     idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> JSONResponse:
-    require_auth(request, authorization)
     body = payload.body
     kind = payload.kind or infer_kind(body)
     if not config.allow_secrets() and looks_like_secret(body):
@@ -249,14 +258,11 @@ def post_capture(
     )
 
 
-@app.get("/v1/search")
+@app.get("/v1/search", dependencies=[Depends(require_auth)])
 def api_search(
-    request: Request,
     q: str = "",
     conn: sqlite3.Connection = Depends(get_conn),
-    authorization: Annotated[str | None, Header()] = None,
 ) -> dict:
-    require_auth(request, authorization)
     rows = search_sources(conn, q) if q else []
     return {
         "hits": [
@@ -270,13 +276,11 @@ def api_search(
     }
 
 
-@app.get("/v1/sources/{source_id}")
+@app.get("/v1/sources/{source_id}", dependencies=[Depends(require_auth)])
 def api_source(
     source_id: str,
-    request: Request,
     preview: bool = Query(default=False),
     conn: sqlite3.Connection = Depends(get_conn),
-    authorization: Annotated[str | None, Header()] = None,
 ) -> dict:
     """The full capture. `preview=1` caps `raw_body` at the display budget.
 
@@ -284,13 +288,12 @@ def api_source(
     the client asks for a preview to render and for the whole thing only when
     it is about to put it on the clipboard.
     """
-    require_auth(request, authorization)
     detail = source_detail(conn, source_id)
     if detail is None:
         raise HTTPException(status_code=404, detail=_problem("not_found", "source missing", 404))
     digest = detail["digest"]
     latest = detail["captures"][0] if detail["captures"] else None
-    raw = latest["raw_body"] if latest else ""
+    raw = detail["latest_body"]
     truncated = preview and len(raw) > DISPLAY_CHARS
     return {
         "source_id": source_id,
@@ -331,16 +334,13 @@ def _prepare_context(raw: str) -> tuple[str | None, str | None]:
     return body, None
 
 
-@app.post("/v1/sources/{source_id}/context")
+@app.post("/v1/sources/{source_id}/context", dependencies=[Depends(require_auth)])
 def api_context(
     source_id: str,
     payload: ContextIn,
-    request: Request,
     conn: sqlite3.Connection = Depends(get_conn),
-    authorization: Annotated[str | None, Header()] = None,
 ) -> Response:
-    require_auth(request, authorization)
-    if source_detail(conn, source_id) is None:
+    if not source_exists(conn, source_id):
         raise HTTPException(status_code=404, detail=_problem("not_found", "source missing", 404))
     body, err = _prepare_context(payload.body)
     if err:
@@ -353,42 +353,33 @@ class ReuseIn(BaseModel):
     kind: str
 
 
-@app.post("/v1/sources/{source_id}/reuse")
+@app.post("/v1/sources/{source_id}/reuse", dependencies=[Depends(require_auth)])
 def api_reuse(
     source_id: str,
     payload: ReuseIn,
-    request: Request,
     conn: sqlite3.Connection = Depends(get_conn),
-    authorization: Annotated[str | None, Header()] = None,
 ) -> dict:
-    require_auth(request, authorization)
     if payload.kind not in {"copy_source", "mark_used"}:
         raise HTTPException(status_code=400, detail=_problem("bad_reuse", "unknown reuse kind", 400))
-    if source_detail(conn, source_id) is None:
+    if not source_exists(conn, source_id):
         raise HTTPException(status_code=404, detail=_problem("not_found", "source missing", 404))
     mark_reuse(conn, source_id, payload.kind)
     return {"ok": True}
 
 
-@app.post("/v1/captures/undo")
+@app.post("/v1/captures/undo", dependencies=[Depends(require_auth)])
 def api_undo(
-    request: Request,
     conn: sqlite3.Connection = Depends(get_conn),
-    authorization: Annotated[str | None, Header()] = None,
 ) -> dict:
-    require_auth(request, authorization)
     result = undo_latest(conn)
     return {"ok": True, "result": result}
 
 
-@app.delete("/v1/captures/{capture_id}")
+@app.delete("/v1/captures/{capture_id}", dependencies=[Depends(require_auth)])
 def api_delete(
     capture_id: str,
-    request: Request,
     conn: sqlite3.Connection = Depends(get_conn),
-    authorization: Annotated[str | None, Header()] = None,
 ) -> dict:
-    require_auth(request, authorization)
     result = delete_capture(conn, capture_id)
     if result == "missing":
         raise HTTPException(status_code=404, detail=_problem("not_found", "capture missing", 404))
@@ -419,19 +410,16 @@ def api_session(
     return {"authenticated": is_authed(request, authorization)}
 
 
-@app.get("/v1/inbox")
+@app.get("/v1/inbox", dependencies=[Depends(require_auth)])
 def api_inbox(
-    request: Request,
     q: str = Query(default=""),
     conn: sqlite3.Connection = Depends(get_conn),
-    authorization: Annotated[str | None, Header()] = None,
 ) -> dict:
     """Recency list, or search hits when `q` is set.
 
     `/v1/search` returns ids for scripts; this returns the columns the list
     actually paints, so opening the inbox is one request instead of N.
     """
-    require_auth(request, authorization)
     rows = search_sources(conn, q) if q else recency_list(conn)
     return {
         "q": q,
@@ -472,10 +460,19 @@ def login(request: Request, token: Annotated[str, Form()] = "") -> Response:
     The client fetches this rather than reimplementing it: the token goes
     straight into an HttpOnly cookie and never lands in JS state, and a no-JS
     client can still post the same form.
+
+    Which answer depends on who asked. A browser form post has nowhere to go
+    but a page, so it keeps the redirect; fetch() follows redirects, so a
+    client that says it wants JSON gets 204 and the same cookie rather than
+    downloading the whole shell only to discard it.
     """
     if not token_matches(token, config.token()):
         return JSONResponse(status_code=401, content=_problem("auth", "token mismatch", 401))
-    resp = RedirectResponse("/", status_code=302)
+    wants_json = "application/json" in request.headers.get("accept", "")
+    resp: Response = (
+        Response(status_code=204) if wants_json else RedirectResponse("/", status_code=302)
+    )
+    resp.headers["Vary"] = "Accept"
     resp.set_cookie(
         config.COOKIE_NAME,
         token,
