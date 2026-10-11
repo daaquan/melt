@@ -1,0 +1,172 @@
+#!/usr/bin/env python3
+"""Mirror melt sources into a folder as Markdown, one file per source.
+
+Stdlib only, like melt-capture. Each file holds the source's latest capture,
+not every capture. Files are never deleted: the inbox is capped, so a source
+missing from it says nothing about whether it still exists.
+
+Exit codes: 0 done, 1 runtime failure, 2 bad settings, 3 incomplete import
+(the inbox came back full), 4 containment failure. Anything but 0 should stop
+whatever reads the mirror next. Logs carry ids and counts, never bodies.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime
+import hashlib
+import json
+import os
+import re
+import sys
+import tempfile
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+# recency_list() in src/melt/db.py returns at most this many rows.
+INBOX_CAP = 100
+SOURCE_ID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+USER_AGENT = "melt-export/0.1"
+ENV_KEYS = frozenset({"MELT_API_URL", "MELT_TOKEN"})
+DEFAULT_ENV_FILE = Path.home() / ".config" / "melt" / "env"
+
+
+class Containment(Exception):
+    pass
+
+
+class Incomplete(Exception):
+    pass
+
+
+def load_environment() -> None:
+    """Fill MELT_API_URL and MELT_TOKEN from MELT_ENV_FILE or ~/.config/melt/env."""
+    path = Path(os.environ.get("MELT_ENV_FILE") or DEFAULT_ENV_FILE)
+    if not path.is_file():
+        return
+    for raw_line in path.read_text(encoding="utf-8-sig").splitlines():
+        key, sep, value = raw_line.strip().partition("=")
+        key, value = key.strip(), value.strip()
+        if not sep or key not in ENV_KEYS or key in os.environ:
+            continue
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        os.environ[key] = value
+
+
+def get_json(api: str, token: str, path: str) -> dict:
+    request = urllib.request.Request(
+        api.rstrip("/") + path,
+        headers={"Authorization": f"Bearer {token}", "User-Agent": USER_AGENT},
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        return json.load(response)
+
+
+def kept_date(existing: str, capture_id: str) -> str | None:
+    """The first export date of this capture, so reruns do not churn the file."""
+    if f"latest_capture_id: {json.dumps(capture_id)}\n" not in existing:
+        return None
+    match = re.search(r"^date_fetched: (\d{4}-\d{2}-\d{2})$", existing, re.MULTILINE)
+    return match.group(1) if match else None
+
+
+def render(detail: dict, fetched: str) -> bytes:
+    raw = detail["raw_body"]
+    kind = detail["kind"]
+    lines = [
+        "---",
+        "type: source",
+        "schema_version: 1",
+        f"description: {json.dumps(detail['normalized_body'].split(chr(10))[0][:80], ensure_ascii=False)}",
+    ]
+    if kind == "url":
+        lines.append(f"source_url: {json.dumps(detail['normalized_body'], ensure_ascii=False)}")
+    lines += [
+        f"date_fetched: {fetched}",
+        f"preservation: {'url-pointer' if kind == 'url' else 'text-extracted'}",
+        "privacy: private",
+        f"melt_source_id: {json.dumps(detail['source_id'])}",
+        f"melt_kind: {json.dumps(kind)}",
+        f"latest_capture_id: {json.dumps(detail['latest_capture_id'])}",
+        f"captured_at: {json.dumps(detail['captured_at'])}",
+        f"occurrence_count: {int(detail['occurrence_count'])}",
+        f"used_count: {int(detail['used_count'])}",
+        f"useful_for: {json.dumps(detail['context'], ensure_ascii=False)}",
+        f"raw_sha256: {json.dumps(hashlib.sha256(raw.encode('utf-8')).hexdigest())}",
+        "tags: [source, melt, layer-ingest, immutable]",
+        "---",
+        "",
+        raw.rstrip("\n"),
+        "",
+    ]
+    return "\n".join(lines).encode("utf-8")
+
+
+def write_if_changed(path: Path, data: bytes) -> bool:
+    if path.is_symlink():
+        raise Containment(f"{path.name} is a symlink")
+    if path.exists() and path.read_bytes() == data:
+        return False
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".melt-export-")
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+    return True
+
+
+def export(api: str, token: str, out: Path) -> tuple[int, int]:
+    rows = get_json(api, token, "/v1/inbox")["rows"]
+    today = datetime.date.today().isoformat()
+    written = 0
+    for row in rows:
+        source_id = str(row["source_id"])
+        if not SOURCE_ID.match(source_id):
+            raise Containment("inbox returned a source id that is not a UUID")
+        detail = get_json(api, token, f"/v1/sources/{source_id}")
+        if detail.get("truncated") or detail.get("source_id") != source_id:
+            raise Incomplete(f"source {source_id} came back partial")
+        path = out / f"{source_id}.md"
+        existing = path.read_text(encoding="utf-8") if path.is_file() and not path.is_symlink() else ""
+        fetched = kept_date(existing, detail["latest_capture_id"]) or today
+        written += write_if_changed(path, render(detail, fetched))
+    return len(rows), written
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Mirror melt sources into a folder as Markdown")
+    parser.add_argument("--out", required=True, type=Path, help="existing folder, e.g. external-sources/melt")
+    args = parser.parse_args(argv)
+    load_environment()
+    api = os.environ.get("MELT_API_URL", "")
+    token = os.environ.get("MELT_TOKEN", "")
+    if not api or not token:
+        print("melt-export: MELT_API_URL and MELT_TOKEN are required", file=sys.stderr)
+        return 2
+    if not args.out.is_dir():
+        print(f"melt-export: {args.out} is not a folder", file=sys.stderr)
+        return 2
+    try:
+        total, written = export(api, token, args.out.resolve())
+    except Containment as e:
+        print(f"melt-export: refused: {e}", file=sys.stderr)
+        return 4
+    except Incomplete as e:
+        print(f"melt-export: incomplete: {e}", file=sys.stderr)
+        return 3
+    except (urllib.error.URLError, OSError, KeyError, TypeError, ValueError) as e:
+        print(f"melt-export: failed: {type(e).__name__}", file=sys.stderr)
+        return 1
+    print(f"melt-export: {total} sources, {written} written")
+    if total >= INBOX_CAP:
+        print(f"melt-export: inbox returned {total} rows, older sources may be missing", file=sys.stderr)
+        return 3
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
